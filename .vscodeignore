@@ -1,0 +1,4 @@
+.vscode/**
+.gitignore
+.npm-cache/**
+*.vsix

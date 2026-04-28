@@ -1,0 +1,186 @@
+{
+  "name": "db-cruiser",
+  "displayName": "DB Cruiser",
+  "description": "A MySQL database explorer and SQL console for VS Code.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:databasePilot.connections",
+    "onCommand:databasePilot.addMySqlConnection",
+    "onCommand:databasePilot.openSqlConsole",
+    "onCommand:databasePilot.runQuery",
+    "onCommand:databasePilot.selectSchema",
+    "onCommand:databasePilot.refresh",
+    "onCommand:databasePilot.removeConnection",
+    "onCommand:databasePilot.testConnection",
+    "onCommand:databasePilot.inspectObject",
+    "onCommand:databasePilot.selectTop100"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "databasePilot",
+          "title": "DB Cruiser",
+          "icon": "resources/database.svg"
+        }
+      ]
+    },
+    "views": {
+      "databasePilot": [
+        {
+          "id": "databasePilot.connections",
+          "name": "Connections",
+          "type": "tree"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "databasePilot.addMySqlConnection",
+        "title": "DB Cruiser: Add MySQL Connection",
+        "icon": "$(database)"
+      },
+      {
+        "command": "databasePilot.refresh",
+        "title": "DB Cruiser: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "databasePilot.removeConnection",
+        "title": "DB Cruiser: Remove Connection",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "databasePilot.testConnection",
+        "title": "DB Cruiser: Test Connection",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "databasePilot.openSqlConsole",
+        "title": "DB Cruiser: Open SQL Console",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "databasePilot.runQuery",
+        "title": "DB Cruiser: Run Query",
+        "icon": "$(play)"
+      },
+      {
+        "command": "databasePilot.selectSchema",
+        "title": "DB Cruiser: Select Console Schema",
+        "icon": "$(database)"
+      },
+      {
+        "command": "databasePilot.inspectObject",
+        "title": "DB Cruiser: Inspect Object",
+        "icon": "$(inspect)"
+      },
+      {
+        "command": "databasePilot.selectTop100",
+        "title": "DB Cruiser: Open Data View",
+        "icon": "$(run)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "databasePilot.addMySqlConnection",
+          "when": "view == databasePilot.connections",
+          "group": "navigation@1"
+        },
+        {
+          "command": "databasePilot.refresh",
+          "when": "view == databasePilot.connections",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "databasePilot.openSqlConsole",
+          "when": "view == databasePilot.connections && viewItem =~ /connection/",
+          "group": "inline@1"
+        },
+        {
+          "command": "databasePilot.testConnection",
+          "when": "view == databasePilot.connections && viewItem =~ /connection/",
+          "group": "inline@2"
+        },
+        {
+          "command": "databasePilot.removeConnection",
+          "when": "view == databasePilot.connections && viewItem =~ /connection/",
+          "group": "inline@3"
+        },
+        {
+          "command": "databasePilot.selectTop100",
+          "when": "view == databasePilot.connections && viewItem =~ /object:table/",
+          "group": "inline@1"
+        },
+        {
+          "command": "databasePilot.inspectObject",
+          "when": "view == databasePilot.connections && viewItem =~ /object/",
+          "group": "inline@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "databasePilot.selectSchema",
+          "when": "editorLangId == sql",
+          "group": "navigation@1"
+        },
+        {
+          "command": "databasePilot.runQuery",
+          "when": "editorLangId == sql",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "databasePilot.selectSchema",
+          "when": "editorLangId == sql",
+          "group": "navigation@1"
+        },
+        {
+          "command": "databasePilot.runQuery",
+          "when": "editorLangId == sql",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "databasePilot.runQuery",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == sql"
+      }
+    ],
+    "configuration": {
+      "title": "DB Cruiser",
+      "properties": {
+        "dbCruiser.mysql.maxRows": {
+          "type": "number",
+          "default": 500,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Maximum rows displayed for ad hoc MySQL query results."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "mysql2": "^3.0.0"
+  },
+  "scripts": {
+    "lint": "node --check src/extension.js",
+    "test": "node --check src/extension.js"
+  }
+}
