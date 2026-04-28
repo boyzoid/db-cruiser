@@ -4,7 +4,9 @@
   "description": "A MySQL database explorer and SQL console for VS Code.",
   "version": "0.0.1",
   "publisher": "local",
+  "author": "The Stroz",
   "private": true,
+  "icon": "resources/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -12,32 +14,32 @@
     "Other"
   ],
   "activationEvents": [
-    "onView:databasePilot.connections",
-    "onCommand:databasePilot.addMySqlConnection",
-    "onCommand:databasePilot.openSqlConsole",
-    "onCommand:databasePilot.runQuery",
-    "onCommand:databasePilot.selectSchema",
-    "onCommand:databasePilot.refresh",
-    "onCommand:databasePilot.removeConnection",
-    "onCommand:databasePilot.testConnection",
-    "onCommand:databasePilot.inspectObject",
-    "onCommand:databasePilot.selectTop100"
+    "onView:dbCruiser.connections",
+    "onCommand:dbCruiser.addMySqlConnection",
+    "onCommand:dbCruiser.openSqlConsole",
+    "onCommand:dbCruiser.runQuery",
+    "onCommand:dbCruiser.selectSchema",
+    "onCommand:dbCruiser.refresh",
+    "onCommand:dbCruiser.removeConnection",
+    "onCommand:dbCruiser.testConnection",
+    "onCommand:dbCruiser.inspectObject",
+    "onCommand:dbCruiser.selectTop100"
   ],
   "main": "./src/extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "databasePilot",
+          "id": "dbCruiser",
           "title": "DB Cruiser",
-          "icon": "resources/database.svg"
+          "icon": "resources/icon.svg"
         }
       ]
     },
     "views": {
-      "databasePilot": [
+      "dbCruiser": [
         {
-          "id": "databasePilot.connections",
+          "id": "dbCruiser.connections",
           "name": "Connections",
           "type": "tree"
         }
@@ -45,47 +47,47 @@
     },
     "commands": [
       {
-        "command": "databasePilot.addMySqlConnection",
+        "command": "dbCruiser.addMySqlConnection",
         "title": "DB Cruiser: Add MySQL Connection",
         "icon": "$(database)"
       },
       {
-        "command": "databasePilot.refresh",
+        "command": "dbCruiser.refresh",
         "title": "DB Cruiser: Refresh",
         "icon": "$(refresh)"
       },
       {
-        "command": "databasePilot.removeConnection",
+        "command": "dbCruiser.removeConnection",
         "title": "DB Cruiser: Remove Connection",
         "icon": "$(trash)"
       },
       {
-        "command": "databasePilot.testConnection",
+        "command": "dbCruiser.testConnection",
         "title": "DB Cruiser: Test Connection",
         "icon": "$(plug)"
       },
       {
-        "command": "databasePilot.openSqlConsole",
+        "command": "dbCruiser.openSqlConsole",
         "title": "DB Cruiser: Open SQL Console",
         "icon": "$(terminal)"
       },
       {
-        "command": "databasePilot.runQuery",
+        "command": "dbCruiser.runQuery",
         "title": "DB Cruiser: Run Query",
         "icon": "$(play)"
       },
       {
-        "command": "databasePilot.selectSchema",
+        "command": "dbCruiser.selectSchema",
         "title": "DB Cruiser: Select Console Schema",
         "icon": "$(database)"
       },
       {
-        "command": "databasePilot.inspectObject",
+        "command": "dbCruiser.inspectObject",
         "title": "DB Cruiser: Inspect Object",
         "icon": "$(inspect)"
       },
       {
-        "command": "databasePilot.selectTop100",
+        "command": "dbCruiser.selectTop100",
         "title": "DB Cruiser: Open Data View",
         "icon": "$(run)"
       }
@@ -93,63 +95,63 @@
     "menus": {
       "view/title": [
         {
-          "command": "databasePilot.addMySqlConnection",
-          "when": "view == databasePilot.connections",
+          "command": "dbCruiser.addMySqlConnection",
+          "when": "view == dbCruiser.connections",
           "group": "navigation@1"
         },
         {
-          "command": "databasePilot.refresh",
-          "when": "view == databasePilot.connections",
+          "command": "dbCruiser.refresh",
+          "when": "view == dbCruiser.connections",
           "group": "navigation@2"
         }
       ],
       "view/item/context": [
         {
-          "command": "databasePilot.openSqlConsole",
-          "when": "view == databasePilot.connections && viewItem =~ /connection/",
+          "command": "dbCruiser.openSqlConsole",
+          "when": "view == dbCruiser.connections && viewItem =~ /connection/",
           "group": "inline@1"
         },
         {
-          "command": "databasePilot.testConnection",
-          "when": "view == databasePilot.connections && viewItem =~ /connection/",
+          "command": "dbCruiser.testConnection",
+          "when": "view == dbCruiser.connections && viewItem =~ /connection/",
           "group": "inline@2"
         },
         {
-          "command": "databasePilot.removeConnection",
-          "when": "view == databasePilot.connections && viewItem =~ /connection/",
+          "command": "dbCruiser.removeConnection",
+          "when": "view == dbCruiser.connections && viewItem =~ /connection/",
           "group": "inline@3"
         },
         {
-          "command": "databasePilot.selectTop100",
-          "when": "view == databasePilot.connections && viewItem =~ /object:table/",
+          "command": "dbCruiser.selectTop100",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:table/",
           "group": "inline@1"
         },
         {
-          "command": "databasePilot.inspectObject",
-          "when": "view == databasePilot.connections && viewItem =~ /object/",
+          "command": "dbCruiser.inspectObject",
+          "when": "view == dbCruiser.connections && viewItem =~ /object/",
           "group": "inline@2"
         }
       ],
       "editor/title": [
         {
-          "command": "databasePilot.selectSchema",
+          "command": "dbCruiser.selectSchema",
           "when": "editorLangId == sql",
           "group": "navigation@1"
         },
         {
-          "command": "databasePilot.runQuery",
+          "command": "dbCruiser.runQuery",
           "when": "editorLangId == sql",
           "group": "navigation@2"
         }
       ],
       "editor/context": [
         {
-          "command": "databasePilot.selectSchema",
+          "command": "dbCruiser.selectSchema",
           "when": "editorLangId == sql",
           "group": "navigation@1"
         },
         {
-          "command": "databasePilot.runQuery",
+          "command": "dbCruiser.runQuery",
           "when": "editorLangId == sql",
           "group": "navigation@2"
         }
@@ -157,7 +159,7 @@
     },
     "keybindings": [
       {
-        "command": "databasePilot.runQuery",
+        "command": "dbCruiser.runQuery",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
         "when": "editorTextFocus && editorLangId == sql"

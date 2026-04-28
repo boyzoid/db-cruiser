@@ -1,13 +1,13 @@
 const vscode = require('vscode');
 const crypto = require('crypto');
 
-const CONNECTIONS_KEY = 'databasePilot.connections';
-const SESSION_SCHEMAS_KEY = 'databasePilot.consoleSessionSchemas';
-const SESSION_ROW_LIMITS_KEY = 'databasePilot.consoleSessionRowLimits';
+const CONNECTIONS_KEY = 'dbCruiser.connections';
+const SESSION_SCHEMAS_KEY = 'dbCruiser.consoleSessionSchemas';
+const SESSION_ROW_LIMITS_KEY = 'dbCruiser.consoleSessionRowLimits';
 const CONSOLE_MARKER = '-- db-cruiser:connection=';
 const SCHEMA_MARKER = '-- db-cruiser:schema=';
 const LEGACY_CONSOLE_MARKER = '-- database-pilot:connection=';
-const MYSQL_PASSWORD_PREFIX = 'databasePilot.mysql.password.';
+const MYSQL_PASSWORD_PREFIX = 'dbCruiser.mysql.password.';
 const DEFAULT_ROW_LIMIT = 500;
 const ROW_LIMIT_OPTIONS = [5, 10, 20, 25, 100, 200, 300, 400, 500];
 const NO_ROW_LIMIT = 'none';
@@ -23,7 +23,7 @@ function activate(context) {
   const resultView = new ResultView();
   const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions);
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
-  status.command = 'databasePilot.selectSchema';
+  status.command = 'dbCruiser.selectSchema';
 
   const updateStatus = () => {
     const consoleContext = getConsoleContextForActiveSqlEditor(store, consoleSessions);
@@ -37,19 +37,19 @@ function activate(context) {
   };
 
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider('databasePilot.connections', provider),
-    vscode.commands.registerCommand('databasePilot.addMySqlConnection', () => addMySqlConnection(store, mysql, provider)),
-    vscode.commands.registerCommand('databasePilot.refresh', () => provider.refresh()),
-    vscode.commands.registerCommand('databasePilot.removeConnection', (node) => removeConnection(node, store, provider)),
-    vscode.commands.registerCommand('databasePilot.testConnection', (node) => testConnection(node, mysql)),
-    vscode.commands.registerCommand('databasePilot.openSqlConsole', (node) => openSqlConsole(node, store, consoleSessions, sqlConsoleView)),
-    vscode.commands.registerCommand('databasePilot.runQuery', () => runQuery(store, consoleSessions, mysql, resultView, provider)),
-    vscode.commands.registerCommand('databasePilot.selectSchema', async () => {
+    vscode.window.registerTreeDataProvider('dbCruiser.connections', provider),
+    vscode.commands.registerCommand('dbCruiser.addMySqlConnection', () => addMySqlConnection(store, mysql, provider)),
+    vscode.commands.registerCommand('dbCruiser.refresh', () => provider.refresh()),
+    vscode.commands.registerCommand('dbCruiser.removeConnection', (node) => removeConnection(node, store, provider)),
+    vscode.commands.registerCommand('dbCruiser.testConnection', (node) => testConnection(node, mysql)),
+    vscode.commands.registerCommand('dbCruiser.openSqlConsole', (node) => openSqlConsole(node, store, consoleSessions, sqlConsoleView)),
+    vscode.commands.registerCommand('dbCruiser.runQuery', () => runQuery(store, consoleSessions, mysql, resultView, provider)),
+    vscode.commands.registerCommand('dbCruiser.selectSchema', async () => {
       await selectSchemaForActiveConsole(store, consoleSessions, mysql);
       updateStatus();
     }),
-    vscode.commands.registerCommand('databasePilot.inspectObject', (node) => inspectObject(node, mysql, resultView)),
-    vscode.commands.registerCommand('databasePilot.selectTop100', (node) => selectTop100(node, mysql, resultView)),
+    vscode.commands.registerCommand('dbCruiser.inspectObject', (node) => inspectObject(node, mysql, resultView)),
+    vscode.commands.registerCommand('dbCruiser.selectTop100', (node) => selectTop100(node, mysql, resultView)),
     status
   );
 
@@ -215,11 +215,25 @@ class DatabaseTreeProvider {
 
     if (node.kind === 'object') {
       try {
+        if (node.objectType === 'table') {
+          return [
+            TreeNode.objectGroup(node.connection, node.schema, node.name, 'columns', 'Columns', 'symbol-field'),
+            TreeNode.objectGroup(node.connection, node.schema, node.name, 'keys', 'Keys', 'key'),
+            TreeNode.objectGroup(node.connection, node.schema, node.name, 'indexes', 'Indexes', 'list-tree'),
+            TreeNode.objectGroup(node.connection, node.schema, node.name, 'foreignKeys', 'Foreign Keys', 'references'),
+            TreeNode.objectGroup(node.connection, node.schema, node.name, 'triggers', 'Triggers', 'zap')
+          ];
+        }
+
         const columns = await this.mysql.columns(node.connection, node.schema, node.name);
         return columns.map((column) => TreeNode.column(node.connection, node.schema, node.name, column));
       } catch (error) {
         return [TreeNode.error(error)];
       }
+    }
+
+    if (node.kind === 'objectGroup') {
+      return this.loadObjectGroup(node);
     }
 
     return [];
@@ -249,6 +263,49 @@ class DatabaseTreeProvider {
       return [TreeNode.error(error)];
     }
   }
+
+  async loadObjectGroup(node) {
+    try {
+      if (node.group === 'columns') {
+        const columns = await this.mysql.columns(node.connection, node.schema, node.objectName);
+        return columns.length
+          ? columns.map((column) => TreeNode.column(node.connection, node.schema, node.objectName, column))
+          : [TreeNode.message('No columns found', '')];
+      }
+
+      if (node.group === 'keys') {
+        const keys = await this.mysql.keys(node.connection, node.schema, node.objectName);
+        return keys.length
+          ? keys.map((key) => TreeNode.key(node.connection, node.schema, node.objectName, key))
+          : [TreeNode.message('No keys found', '')];
+      }
+
+      if (node.group === 'indexes') {
+        const indexes = await this.mysql.indexes(node.connection, node.schema, node.objectName);
+        return indexes.length
+          ? indexes.map((index) => TreeNode.index(node.connection, node.schema, node.objectName, index))
+          : [TreeNode.message('No indexes found', '')];
+      }
+
+      if (node.group === 'foreignKeys') {
+        const foreignKeys = await this.mysql.foreignKeys(node.connection, node.schema, node.objectName);
+        return foreignKeys.length
+          ? foreignKeys.map((foreignKey) => TreeNode.foreignKey(node.connection, node.schema, node.objectName, foreignKey))
+          : [TreeNode.message('No foreign keys found', '')];
+      }
+
+      if (node.group === 'triggers') {
+        const triggers = await this.mysql.triggers(node.connection, node.schema, node.objectName);
+        return triggers.length
+          ? triggers.map((trigger) => TreeNode.trigger(node.connection, node.schema, node.objectName, trigger))
+          : [TreeNode.message('No triggers found', '')];
+      }
+    } catch (error) {
+      return [TreeNode.error(error)];
+    }
+
+    return [];
+  }
 }
 
 class TreeNode {
@@ -273,8 +330,28 @@ class TreeNode {
     return new TreeNode('object', { connection, schema, name, objectType });
   }
 
+  static objectGroup(connection, schema, objectName, group, label, icon) {
+    return new TreeNode('objectGroup', { connection, schema, objectName, group, label, icon });
+  }
+
   static column(connection, schema, objectName, column) {
     return new TreeNode('column', { connection, schema, objectName, column });
+  }
+
+  static key(connection, schema, objectName, key) {
+    return new TreeNode('key', { connection, schema, objectName, key });
+  }
+
+  static index(connection, schema, objectName, index) {
+    return new TreeNode('index', { connection, schema, objectName, index });
+  }
+
+  static foreignKey(connection, schema, objectName, foreignKey) {
+    return new TreeNode('foreignKey', { connection, schema, objectName, foreignKey });
+  }
+
+  static trigger(connection, schema, objectName, trigger) {
+    return new TreeNode('trigger', { connection, schema, objectName, trigger });
   }
 
   static console(connection, schema) {
@@ -323,10 +400,17 @@ class TreeNode {
       item.iconPath = new vscode.ThemeIcon(this.objectType === 'view' ? 'eye' : 'table');
       item.contextValue = `object object:${this.objectType}`;
       item.command = {
-        command: this.objectType === 'table' ? 'databasePilot.selectTop100' : 'databasePilot.inspectObject',
+        command: this.objectType === 'table' ? 'dbCruiser.selectTop100' : 'dbCruiser.inspectObject',
         title: this.objectType === 'table' ? 'Open Data View' : 'Inspect Object',
         arguments: [this]
       };
+      return item;
+    }
+
+    if (this.kind === 'objectGroup') {
+      const item = new vscode.TreeItem(this.label, vscode.TreeItemCollapsibleState.Collapsed);
+      item.iconPath = new vscode.ThemeIcon(this.icon);
+      item.contextValue = `objectGroup objectGroup:${this.group}`;
       return item;
     }
 
@@ -339,13 +423,49 @@ class TreeNode {
       return item;
     }
 
+    if (this.kind === 'key') {
+      const item = new vscode.TreeItem(this.key.name, vscode.TreeItemCollapsibleState.None);
+      item.description = formatKeyDescription(this.key);
+      item.tooltip = formatKeyTooltip(this.key);
+      item.iconPath = new vscode.ThemeIcon(this.key.type === 'PRIMARY KEY' ? 'key' : 'symbol-key');
+      item.contextValue = 'key';
+      return item;
+    }
+
+    if (this.kind === 'index') {
+      const item = new vscode.TreeItem(this.index.name, vscode.TreeItemCollapsibleState.None);
+      item.description = formatIndexDescription(this.index);
+      item.tooltip = this.index.type || 'Index';
+      item.iconPath = new vscode.ThemeIcon(this.index.name === 'PRIMARY' ? 'key' : 'list-tree');
+      item.contextValue = 'index';
+      return item;
+    }
+
+    if (this.kind === 'foreignKey') {
+      const item = new vscode.TreeItem(this.foreignKey.name, vscode.TreeItemCollapsibleState.None);
+      item.description = formatForeignKeyDescription(this.foreignKey);
+      item.tooltip = formatForeignKeyTooltip(this.foreignKey);
+      item.iconPath = new vscode.ThemeIcon('references');
+      item.contextValue = 'foreignKey';
+      return item;
+    }
+
+    if (this.kind === 'trigger') {
+      const item = new vscode.TreeItem(this.trigger.name, vscode.TreeItemCollapsibleState.None);
+      item.description = formatTriggerDescription(this.trigger);
+      item.tooltip = this.trigger.statement || 'Trigger';
+      item.iconPath = new vscode.ThemeIcon('zap');
+      item.contextValue = 'trigger';
+      return item;
+    }
+
     if (this.kind === 'console') {
       const item = new vscode.TreeItem('SQL Console', vscode.TreeItemCollapsibleState.None);
       item.description = this.schema;
       item.iconPath = new vscode.ThemeIcon('terminal');
       item.contextValue = 'console';
       item.command = {
-        command: 'databasePilot.openSqlConsole',
+        command: 'dbCruiser.openSqlConsole',
         title: 'Open SQL Console',
         arguments: [this]
       };
@@ -477,6 +597,122 @@ class MySqlAdapter {
     }
   }
 
+  async keys(connection, schema, tableName) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      const [rows] = await client.execute(`
+        select
+          tc.constraint_name as name,
+          tc.constraint_type as type,
+          group_concat(kcu.column_name order by kcu.ordinal_position separator ', ') as columns
+        from information_schema.table_constraints tc
+        left join information_schema.key_column_usage kcu
+          on kcu.constraint_schema = tc.constraint_schema
+          and kcu.constraint_name = tc.constraint_name
+          and kcu.table_schema = tc.table_schema
+          and kcu.table_name = tc.table_name
+        where tc.table_schema = ?
+          and tc.table_name = ?
+          and tc.constraint_type in ('PRIMARY KEY', 'UNIQUE')
+        group by tc.constraint_name, tc.constraint_type
+        order by
+          case tc.constraint_type
+            when 'PRIMARY KEY' then 1
+            when 'UNIQUE' then 2
+            else 4
+          end,
+          tc.constraint_name
+      `, [schema, tableName]);
+      return rows;
+    } finally {
+      await client.end();
+    }
+  }
+
+  async indexes(connection, schema, tableName) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      const [rows] = await client.execute(`
+        select
+          index_name as name,
+          case min(non_unique) when 0 then 'Unique' else 'Non-unique' end as uniqueness,
+          index_type as type,
+          group_concat(
+            if(
+              sub_part is null,
+              coalesce(column_name, '<expression>'),
+              concat(coalesce(column_name, '<expression>'), '(', sub_part, ')')
+            )
+            order by seq_in_index
+            separator ', '
+          ) as columns,
+          max(cardinality) as cardinality
+        from information_schema.statistics
+        where table_schema = ?
+          and table_name = ?
+        group by index_name, index_type
+        order by
+          case index_name when 'PRIMARY' then 1 else 2 end,
+          index_name
+      `, [schema, tableName]);
+      return rows;
+    } finally {
+      await client.end();
+    }
+  }
+
+  async foreignKeys(connection, schema, tableName) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      const [rows] = await client.execute(`
+        select
+          kcu.constraint_name as name,
+          group_concat(kcu.column_name order by kcu.ordinal_position separator ', ') as columns,
+          max(kcu.referenced_table_schema) as referencedSchema,
+          max(kcu.referenced_table_name) as referencedTable,
+          group_concat(kcu.referenced_column_name order by kcu.position_in_unique_constraint separator ', ') as referencedColumns,
+          max(rc.update_rule) as updateRule,
+          max(rc.delete_rule) as deleteRule
+        from information_schema.key_column_usage kcu
+        left join information_schema.referential_constraints rc
+          on rc.constraint_schema = kcu.constraint_schema
+          and rc.constraint_name = kcu.constraint_name
+          and rc.table_name = kcu.table_name
+        where kcu.table_schema = ?
+          and kcu.table_name = ?
+          and kcu.referenced_table_name is not null
+        group by kcu.constraint_schema, kcu.constraint_name
+        order by kcu.constraint_name
+      `, [schema, tableName]);
+      return rows;
+    } finally {
+      await client.end();
+    }
+  }
+
+  async triggers(connection, schema, tableName) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      const [rows] = await client.execute(`
+        select
+          trigger_name as name,
+          action_timing as timing,
+          event_manipulation as event,
+          action_orientation as orientation,
+          action_statement as statement,
+          created,
+          definer
+        from information_schema.triggers
+        where trigger_schema = ?
+          and event_object_table = ?
+        order by event_manipulation, action_timing, trigger_name
+      `, [schema, tableName]);
+      return rows;
+    } finally {
+      await client.end();
+    }
+  }
+
   async ddl(connection, schema, objectName, objectType) {
     const client = await this.connect(connection, undefined, { database: undefined });
     try {
@@ -508,7 +744,7 @@ class ResultView {
   show(title, result) {
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
-        'databasePilot.results',
+        'dbCruiser.results',
         'DB Cruiser Results',
         vscode.ViewColumn.Beside,
         {
@@ -558,7 +794,7 @@ class SqlConsoleView {
     }
 
     const panel = vscode.window.createWebviewPanel(
-      'databasePilot.sqlConsole',
+      'dbCruiser.sqlConsole',
       `${connection.name} Console`,
       vscode.ViewColumn.Active,
       {
@@ -582,7 +818,7 @@ class SqlConsoleView {
       selectedSchema,
       selectedRowLimit,
       schemaError,
-      sql: defaultConsoleSql(selectedSchema)
+      sql: ''
     });
 
     panel.webview.onDidReceiveMessage(async (message) => {
@@ -671,7 +907,7 @@ class SqlConsoleView {
 
 async function addMySqlConnection(store, mysql, provider) {
   const panel = vscode.window.createWebviewPanel(
-    'databasePilot.connectionForm',
+    'dbCruiser.connectionForm',
     'DB Cruiser MySQL Connection',
     vscode.ViewColumn.Active,
     {
@@ -905,10 +1141,20 @@ async function inspectObject(node, mysql, resultView) {
   }
 
   try {
-    const [columns, ddl] = await Promise.all([
+    const metadata = [
       mysql.columns(node.connection, node.schema, node.name),
       mysql.ddl(node.connection, node.schema, node.name, node.objectType)
-    ]);
+    ];
+    if (node.objectType === 'table') {
+      metadata.push(
+        mysql.keys(node.connection, node.schema, node.name),
+        mysql.indexes(node.connection, node.schema, node.name),
+        mysql.foreignKeys(node.connection, node.schema, node.name),
+        mysql.triggers(node.connection, node.schema, node.name)
+      );
+    }
+
+    const [columns, ddl, keys = [], indexes = [], foreignKeys = [], triggers = []] = await Promise.all(metadata);
     resultView.show(`${node.name} Details`, {
       kind: 'object',
       connection: node.connection,
@@ -916,6 +1162,10 @@ async function inspectObject(node, mysql, resultView) {
       objectName: node.name,
       objectType: node.objectType,
       columns,
+      keys,
+      indexes,
+      foreignKeys,
+      triggers,
       ddl
     });
   } catch (error) {
@@ -1050,7 +1300,7 @@ function getConsoleContextForDocument(document, store, consoleSessions) {
 
 function getMaxRows() {
   const configuration = vscode.workspace.getConfiguration();
-  return configuration.get('dbCruiser.mysql.maxRows', configuration.get('databasePilot.mysql.maxRows', DEFAULT_ROW_LIMIT));
+  return configuration.get('dbCruiser.mysql.maxRows', configuration.get('dbCruiser.mysql.maxRows', DEFAULT_ROW_LIMIT));
 }
 
 function getSelectedOrFullText(editor) {
@@ -1198,6 +1448,96 @@ function formatColumnDescription(column) {
   return parts.join(' ');
 }
 
+function formatKeyDescription(key) {
+  const parts = [];
+  if (key.type) {
+    parts.push(formatConstraintType(key.type));
+  }
+  if (key.columns) {
+    parts.push(`(${key.columns})`);
+  }
+  return parts.join(' ');
+}
+
+function formatKeyTooltip(key) {
+  return formatKeyDescription(key) || 'Key';
+}
+
+function formatIndexDescription(index) {
+  const parts = [];
+  if (index.uniqueness) {
+    parts.push(index.uniqueness);
+  }
+  if (index.type) {
+    parts.push(index.type);
+  }
+  if (index.columns) {
+    parts.push(`(${index.columns})`);
+  }
+  if (index.cardinality !== null && index.cardinality !== undefined) {
+    parts.push(`cardinality ${index.cardinality}`);
+  }
+  return parts.join(' ');
+}
+
+function formatForeignKeyDescription(foreignKey) {
+  const parts = [];
+  if (foreignKey.columns) {
+    parts.push(foreignKey.columns);
+  }
+  const target = formatForeignKeyTarget(foreignKey);
+  if (target) {
+    parts.push(`-> ${target}`);
+  }
+  return parts.join(' ');
+}
+
+function formatForeignKeyTooltip(foreignKey) {
+  return [
+    `Foreign key ${foreignKey.name}`,
+    formatForeignKeyDescription(foreignKey),
+    ...formatForeignKeyRules(foreignKey)
+  ].filter(Boolean).join('\n');
+}
+
+function formatTriggerDescription(trigger) {
+  return [trigger.timing, trigger.event].filter(Boolean).join(' ') || 'Trigger';
+}
+
+function formatConstraintType(type) {
+  if (type === 'PRIMARY KEY') {
+    return 'Primary key';
+  }
+  if (type === 'UNIQUE') {
+    return 'Unique';
+  }
+  if (type === 'FOREIGN KEY') {
+    return 'Foreign key';
+  }
+  return String(type || 'Key');
+}
+
+function formatForeignKeyTarget(foreignKey) {
+  if (!foreignKey.referencedTable) {
+    return '';
+  }
+
+  const schema = foreignKey.referencedSchema ? `${foreignKey.referencedSchema}.` : '';
+  const columns = foreignKey.referencedColumns ? `(${foreignKey.referencedColumns})` : '';
+  return `${schema}${foreignKey.referencedTable}${columns}`;
+}
+
+function formatForeignKeyRules(foreignKey) {
+  const rules = [];
+  if (foreignKey.updateRule) {
+    rules.push(`on update ${String(foreignKey.updateRule).toLowerCase()}`);
+  }
+  if (foreignKey.deleteRule) {
+    rules.push(`on delete ${String(foreignKey.deleteRule).toLowerCase()}`);
+  }
+  return rules;
+}
+
 function suggestedConnectionName({ host, user, database }) {
   if (database) {
     return `${database} (${host})`;
@@ -1206,23 +1546,6 @@ function suggestedConnectionName({ host, user, database }) {
     return `${user}@${host}`;
   }
   return '';
-}
-
-function defaultConsoleSql(schema) {
-  if (schema) {
-    return [
-      'select table_name, table_type, engine, table_rows',
-      'from information_schema.tables',
-      'where table_schema = database()',
-      'order by table_name;'
-    ].join('\n');
-  }
-
-  return [
-    'select schema_name',
-    'from information_schema.schemata',
-    'order by schema_name;'
-  ].join('\n');
 }
 
 function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRowLimit, schemaError, sql }) {
@@ -1333,6 +1656,13 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     }
     button:hover {
       background: var(--button-hover);
+    }
+    button.secondary {
+      color: var(--vscode-button-secondaryForeground);
+      background: var(--vscode-button-secondaryBackground);
+    }
+    button.secondary:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
     }
     button:disabled {
       opacity: 0.6;
@@ -1460,6 +1790,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
         </select>
       </label>
       <button id="run" type="button">Run</button>
+      <button id="clear" class="secondary" type="button">Clear</button>
     </section>
     <textarea id="sql" spellcheck="false">${escapeHtml(sql)}</textarea>
     <div id="status" class="${initialStatusClass}" role="status" aria-live="polite">${initialStatus}</div>
@@ -1471,11 +1802,13 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     const rowLimit = document.getElementById('row-limit');
     const sql = document.getElementById('sql');
     const run = document.getElementById('run');
+    const clear = document.getElementById('clear');
     const status = document.getElementById('status');
     const results = document.getElementById('results');
 
     function setBusy(isBusy) {
       run.disabled = isBusy;
+      clear.disabled = isBusy;
       schema.disabled = isBusy;
       rowLimit.disabled = isBusy;
     }
@@ -1497,6 +1830,12 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     }
 
     run.addEventListener('click', execute);
+    clear.addEventListener('click', () => {
+      sql.value = '';
+      results.innerHTML = '';
+      setStatus('', '');
+      sql.focus();
+    });
     schema.addEventListener('change', () => {
       vscode.postMessage({
         command: 'schemaChanged',
@@ -1965,6 +2304,15 @@ function renderQueryResults(result) {
 }
 
 function renderObjectDetails(result) {
+  const tableMetadata = result.objectType === 'table'
+    ? [
+        renderObjectTableBlock('Keys', result.keys, 'No keys found.'),
+        renderObjectTableBlock('Indexes', result.indexes, 'No indexes found.'),
+        renderObjectTableBlock('Foreign Keys', result.foreignKeys, 'No foreign keys found.'),
+        renderObjectTableBlock('Triggers', result.triggers, 'No triggers found.')
+      ].join('')
+    : '';
+
   return `<header class="header">
     <div>
       <h1 class="title">${escapeHtml(result.objectName)}</h1>
@@ -1976,9 +2324,17 @@ function renderObjectDetails(result) {
     <div class="block-title">Columns</div>
     <div class="scroller">${renderTable(result.columns)}</div>
   </section>
+  ${tableMetadata}
   <section class="block">
     <div class="block-title">DDL</div>
     <pre><code>${escapeHtml(result.ddl || 'No DDL available.')}</code></pre>
+  </section>`;
+}
+
+function renderObjectTableBlock(title, rows = [], emptyLabel = 'No rows.') {
+  return `<section class="block">
+    <div class="block-title">${escapeHtml(title)}</div>
+    <div class="scroller">${rows.length ? renderTable(rows) : `<div class="empty">${escapeHtml(emptyLabel)}</div>`}</div>
   </section>`;
 }
 

@@ -6,12 +6,13 @@ DB Cruiser is a VS Code extension scaffold for MySQL database browsing and query
 
 - DB Cruiser activity bar view with saved connections.
 - Add MySQL database connections from a single form, with passwords stored in VS Code SecretStorage.
-- Browse schemas, tables, views, and columns.
+- Browse schemas, tables, views, columns, keys, indexes, foreign keys, and triggers.
 - Open a table data view from the tree.
 - Test saved connections.
 - Open a fileless SQL console bound to a connection.
 - Select the active SQL console schema from a visible dropdown.
 - Configure the console row limit with 5, 10, 20, 25, 100, 200, 300, 400, 500, or No Limit.
+- Clear the console editor and current results from the console toolbar.
 - Run selected SQL or the whole editor with `Cmd+Enter` on macOS or `Ctrl+Enter` elsewhere.
 - View query results and object details in a VS Code webview.
 
@@ -25,7 +26,7 @@ DB Cruiser is a VS Code extension scaffold for MySQL database browsing and query
 
 ## SQL Console
 
-Open **SQL Console** from a connection or schema in the DB Cruiser tree. The console opens as a DB Cruiser panel with schema and limit dropdowns, SQL editor, Run button, and results area. It is not backed by a `.sql` file, so closing it should not ask whether to save anything.
+Open **SQL Console** from a connection or schema in the DB Cruiser tree. The console opens as a DB Cruiser panel with schema and limit dropdowns, SQL editor, Run and Clear buttons, and results area. It is not backed by a `.sql` file, so closing it should not ask whether to save anything.
 
 ## Notes
 
