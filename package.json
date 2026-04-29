@@ -1,17 +1,30 @@
 {
   "name": "db-cruiser",
   "displayName": "DB Cruiser",
-  "description": "A MySQL database explorer and SQL console for VS Code.",
+  "description": "A database explorer and SQL console for VS Code.",
   "version": "0.0.1",
-  "publisher": "local",
+  "publisher": "stroz-dot-dev",
   "author": "The Stroz",
-  "private": true,
+  "license": "MIT",
+  "repository": "https://github.com/boyzoid/db-cruiser",
   "icon": "resources/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
+    "Data Science",
+    "Visualization",
     "Other"
+  ],
+  "keywords": [
+    "database",
+    "sql",
+    "mysql",
+    "database-explorer",
+    "schema-browser",
+    "sql-console",
+    "query-runner",
+    "data-grid"
   ],
   "activationEvents": [
     "onView:dbCruiser.connections",
