@@ -1,0 +1,13 @@
+# Change Log
+
+## 0.1.0
+
+- Added schema-aware SQL completions for table names, aliases, and columns.
+- Added SQL syntax highlighting and smart indentation in the console editor.
+- Added active schema and row limit controls to the SQL console toolbar.
+- Added query result exports for CSV, JSON, and Markdown.
+- Improved query result rendering and object inspection views.
+
+## 0.0.1
+
+- Initial DB Cruiser release with MySQL connection management, schema browsing, query execution, and table data views.

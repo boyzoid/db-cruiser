@@ -1,9 +1,12 @@
 const vscode = require('vscode');
 const crypto = require('crypto');
+const os = require('os');
+const path = require('path');
 
 const CONNECTIONS_KEY = 'dbCruiser.connections';
 const SESSION_SCHEMAS_KEY = 'dbCruiser.consoleSessionSchemas';
 const SESSION_ROW_LIMITS_KEY = 'dbCruiser.consoleSessionRowLimits';
+const SESSION_SQL_KEY = 'dbCruiser.consoleSessionSql';
 const CONSOLE_MARKER = '-- db-cruiser:connection=';
 const SCHEMA_MARKER = '-- db-cruiser:schema=';
 const LEGACY_CONSOLE_MARKER = '-- database-pilot:connection=';
@@ -11,6 +14,14 @@ const MYSQL_PASSWORD_PREFIX = 'dbCruiser.mysql.password.';
 const DEFAULT_ROW_LIMIT = 500;
 const ROW_LIMIT_OPTIONS = [5, 10, 20, 25, 100, 200, 300, 400, 500];
 const NO_ROW_LIMIT = 'none';
+const METADATA_CACHE_TTL_MS = 60 * 1000;
+const SQL_RESERVED_WORDS = new Set([
+  'add', 'all', 'alter', 'and', 'as', 'asc', 'between', 'by', 'case', 'create', 'cross',
+  'delete', 'desc', 'distinct', 'drop', 'else', 'end', 'exists', 'from', 'full', 'group',
+  'having', 'in', 'inner', 'insert', 'into', 'is', 'join', 'left', 'like', 'limit',
+  'not', 'null', 'on', 'or', 'order', 'outer', 'right', 'select', 'set', 'then',
+  'union', 'update', 'values', 'when', 'where'
+]);
 
 /**
  * @param {vscode.ExtensionContext} context
@@ -21,7 +32,9 @@ function activate(context) {
   const mysql = new MySqlAdapter(context.secrets);
   const provider = new DatabaseTreeProvider(store, mysql);
   const resultView = new ResultView();
-  const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions);
+  const sqlCompletionCache = new SqlCompletionMetadataCache(mysql);
+  const sqlCompletionProvider = new SqlCompletionProvider(store, consoleSessions, sqlCompletionCache);
+  const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions, sqlCompletionCache);
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   status.command = 'dbCruiser.selectSchema';
 
@@ -37,12 +50,16 @@ function activate(context) {
   };
 
   context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider({ language: 'sql' }, sqlCompletionProvider, '.', ' ', '`'),
     vscode.window.registerTreeDataProvider('dbCruiser.connections', provider),
     vscode.commands.registerCommand('dbCruiser.addMySqlConnection', () => addMySqlConnection(store, mysql, provider)),
     vscode.commands.registerCommand('dbCruiser.refresh', () => provider.refresh()),
     vscode.commands.registerCommand('dbCruiser.removeConnection', (node) => removeConnection(node, store, provider)),
     vscode.commands.registerCommand('dbCruiser.testConnection', (node) => testConnection(node, mysql)),
-    vscode.commands.registerCommand('dbCruiser.openSqlConsole', (node) => openSqlConsole(node, store, consoleSessions, sqlConsoleView)),
+    vscode.commands.registerCommand('dbCruiser.openSqlConsole', async (node) => {
+      await openSqlConsole(node, store, consoleSessions, sqlConsoleView);
+      updateStatus();
+    }),
     vscode.commands.registerCommand('dbCruiser.runQuery', () => runQuery(store, consoleSessions, mysql, resultView, provider)),
     vscode.commands.registerCommand('dbCruiser.selectSchema', async () => {
       await selectSchemaForActiveConsole(store, consoleSessions, mysql);
@@ -55,7 +72,6 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor(updateStatus),
-    vscode.workspace.onDidCloseTextDocument((document) => consoleSessions.release(document)),
     vscode.workspace.onDidChangeTextDocument((event) => {
       if (event.document === vscode.window.activeTextEditor?.document) {
         updateStatus();
@@ -138,6 +154,11 @@ class ConsoleSessionStore {
     return normalizeRowLimit(rowLimits[connectionId] ?? getMaxRows());
   }
 
+  getSavedSql(connectionId) {
+    const documents = this.context.workspaceState.get(SESSION_SQL_KEY, {});
+    return documents[connectionId];
+  }
+
   async setSavedSchema(connectionId, schema) {
     const schemas = {
       ...this.context.workspaceState.get(SESSION_SCHEMAS_KEY, {})
@@ -156,6 +177,14 @@ class ConsoleSessionStore {
     };
     rowLimits[connectionId] = normalizeRowLimit(rowLimit);
     await this.context.workspaceState.update(SESSION_ROW_LIMITS_KEY, rowLimits);
+  }
+
+  async setSavedSql(connectionId, sql) {
+    const documents = {
+      ...this.context.workspaceState.get(SESSION_SQL_KEY, {})
+    };
+    documents[connectionId] = String(sql || '');
+    await this.context.workspaceState.update(SESSION_SQL_KEY, documents);
   }
 
   async setSchema(document, connectionId, schema) {
@@ -597,6 +626,33 @@ class MySqlAdapter {
     }
   }
 
+  async completionMetadata(connection, schema) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      const [rows] = await client.execute(`
+        select
+          t.table_name as tableName,
+          case when t.table_type = 'VIEW' then 'view' else 'table' end as objectType,
+          c.column_name as columnName,
+          c.column_type as columnType,
+          c.is_nullable as nullable,
+          c.column_key as columnKey,
+          c.extra,
+          c.ordinal_position as ordinal
+        from information_schema.tables t
+        left join information_schema.columns c
+          on c.table_schema = t.table_schema
+          and c.table_name = t.table_name
+        where t.table_schema = ?
+          and t.table_type in ('BASE TABLE', 'VIEW')
+        order by t.table_name, c.ordinal_position
+      `, [schema]);
+      return buildCompletionMetadata(schema, rows);
+    } finally {
+      await client.end();
+    }
+  }
+
   async keys(connection, schema, tableName) {
     const client = await this.connect(connection, undefined, { database: undefined });
     try {
@@ -739,21 +795,25 @@ class MySqlAdapter {
 class ResultView {
   constructor() {
     this.panel = undefined;
+    this.result = undefined;
   }
 
   show(title, result) {
+    this.result = result;
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel(
         'dbCruiser.results',
         'DB Cruiser Results',
         vscode.ViewColumn.Beside,
         {
-          enableScripts: false,
+          enableScripts: true,
           retainContextWhenHidden: true
         }
       );
+      this.panel.webview.onDidReceiveMessage((message) => this.handleMessage(message));
       this.panel.onDidDispose(() => {
         this.panel = undefined;
+        this.result = undefined;
       });
     }
 
@@ -761,17 +821,28 @@ class ResultView {
     this.panel.webview.html = renderResultHtml(result);
     this.panel.reveal(vscode.ViewColumn.Beside);
   }
+
+  async handleMessage(message) {
+    if (!message || message.command !== 'exportResultSet') {
+      return;
+    }
+
+    await exportQueryResultSet(this.result, message.resultSetIndex, message.format);
+  }
 }
 
 class SqlConsoleView {
   /**
    * @param {MySqlAdapter} mysql
    * @param {ConsoleSessionStore} consoleSessions
+   * @param {SqlCompletionMetadataCache} completionMetadataCache
    */
-  constructor(mysql, consoleSessions) {
+  constructor(mysql, consoleSessions, completionMetadataCache) {
     this.mysql = mysql;
     this.consoleSessions = consoleSessions;
+    this.completionMetadataCache = completionMetadataCache;
     this.panels = new Map();
+    this.panelResults = new WeakMap();
   }
 
   async open(connection, schema) {
@@ -818,19 +889,36 @@ class SqlConsoleView {
       selectedSchema,
       selectedRowLimit,
       schemaError,
-      sql: ''
+      sql: this.consoleSessions.getSavedSql(connection.id) || ''
     });
 
     panel.webview.onDidReceiveMessage(async (message) => {
-      if (!message || !['run', 'schemaChanged', 'rowLimitChanged'].includes(message.command)) {
+      if (!message || !['run', 'schemaChanged', 'rowLimitChanged', 'sqlChanged', 'completion', 'exportResultSet'].includes(message.command)) {
+        return;
+      }
+
+      if (message.command === 'exportResultSet') {
+        await exportQueryResultSet(this.panelResults.get(panel), message.resultSetIndex, message.format);
         return;
       }
 
       const nextSchema = String(message.schema || '').trim();
       const rowLimit = normalizeRowLimit(message.rowLimit);
+      const sql = String(message.sql || '');
+
+      if (message.command === 'completion') {
+        await this.complete(panel, connection, nextSchema, sql, message.offset, message.requestId);
+        return;
+      }
+
       await this.consoleSessions.setSavedSchema(connection.id, nextSchema);
       await this.consoleSessions.setSavedRowLimit(connection.id, rowLimit);
+      await this.consoleSessions.setSavedSql(connection.id, sql);
       panel.title = `${connection.name} Console`;
+
+      if (message.command === 'sqlChanged') {
+        return;
+      }
 
       if (message.command === 'schemaChanged') {
         await panel.webview.postMessage({
@@ -850,8 +938,7 @@ class SqlConsoleView {
         return;
       }
 
-      const sql = String(message.sql || '');
-      if (!sql.trim()) {
+      if (!hasRunnableSql(sql)) {
         await panel.webview.postMessage({
           type: 'status',
           state: 'error',
@@ -871,6 +958,33 @@ class SqlConsoleView {
     this.panels.set(key, { panel });
   }
 
+  async complete(panel, connection, schema, sql, offset, requestId) {
+    const selectedSchema = schema || connection.database;
+    const fallback = {
+      type: 'completion',
+      requestId,
+      replaceStart: clampOffset(offset, sql),
+      replaceEnd: clampOffset(offset, sql),
+      items: []
+    };
+
+    if (!selectedSchema) {
+      await panel.webview.postMessage(fallback);
+      return;
+    }
+
+    try {
+      const metadata = await this.completionMetadataCache.get(connection, selectedSchema);
+      await panel.webview.postMessage({
+        type: 'completion',
+        requestId,
+        ...buildSqlCompletionSuggestions(sql, offset, metadata)
+      });
+    } catch {
+      await panel.webview.postMessage(fallback);
+    }
+  }
+
   async run(panel, connection, schema, sql, rowLimit) {
     await panel.webview.postMessage({
       type: 'status',
@@ -882,18 +996,20 @@ class SqlConsoleView {
       const started = Date.now();
       const resultSets = await this.mysql.query(connection, appendLimitHint(sql, rowLimit), schema || connection.database);
       const elapsedMs = Date.now() - started;
+      const result = {
+        kind: 'query',
+        connection,
+        schema: schema || connection.database,
+        sql,
+        elapsedMs,
+        resultSets
+      };
+      this.panelResults.set(panel, result);
       await panel.webview.postMessage({
         type: 'results',
         state: 'success',
         message: `Completed in ${elapsedMs} ms.`,
-        html: renderQueryResults({
-          kind: 'query',
-          connection,
-          schema: schema || connection.database,
-          sql,
-          elapsedMs,
-          resultSets
-        })
+        html: renderQueryResults(result)
       });
     } catch (error) {
       await panel.webview.postMessage({
@@ -901,6 +1017,76 @@ class SqlConsoleView {
         state: 'error',
         message: errorMessage(error)
       });
+    }
+  }
+}
+
+class SqlCompletionMetadataCache {
+  /**
+   * @param {MySqlAdapter} mysql
+   */
+  constructor(mysql) {
+    this.mysql = mysql;
+    this.entries = new Map();
+  }
+
+  async get(connection, schema) {
+    if (!schema) {
+      return emptyCompletionMetadata(schema);
+    }
+
+    const key = `${connection.id}:${schema}`;
+    const existing = this.entries.get(key);
+    if (existing && Date.now() - existing.createdAt < METADATA_CACHE_TTL_MS) {
+      return existing.promise;
+    }
+
+    const promise = this.mysql.completionMetadata(connection, schema).catch((error) => {
+      this.entries.delete(key);
+      throw error;
+    });
+    this.entries.set(key, {
+      createdAt: Date.now(),
+      promise
+    });
+    return promise;
+  }
+}
+
+class SqlCompletionProvider {
+  /**
+   * @param {ConnectionStore} store
+   * @param {ConsoleSessionStore} consoleSessions
+   * @param {SqlCompletionMetadataCache} metadataCache
+   */
+  constructor(store, consoleSessions, metadataCache) {
+    this.store = store;
+    this.consoleSessions = consoleSessions;
+    this.metadataCache = metadataCache;
+  }
+
+  async provideCompletionItems(document, position, token) {
+    const consoleContext = getConsoleContextForDocument(document, this.store, this.consoleSessions);
+    if (!consoleContext?.connection) {
+      return undefined;
+    }
+
+    const schema = consoleContext.schema || consoleContext.connection.database;
+    if (!schema) {
+      return undefined;
+    }
+
+    try {
+      const metadata = await this.metadataCache.get(consoleContext.connection, schema);
+      if (token.isCancellationRequested) {
+        return undefined;
+      }
+
+      const sql = document.getText();
+      const offset = document.offsetAt(position);
+      return buildSqlCompletionList(document, position, sql, offset, metadata);
+    } catch {
+      return undefined;
     }
   }
 }
@@ -1103,7 +1289,7 @@ async function runQuery(store, consoleSessions, mysql, resultView, provider) {
   const schema = consoleContext?.schema || connection.database;
 
   const sql = getSelectedOrFullText(editor);
-  if (!sql.trim()) {
+  if (!hasRunnableSql(sql)) {
     vscode.window.showInformationMessage('There is no SQL to run.');
     return;
   }
@@ -1117,7 +1303,9 @@ async function runQuery(store, consoleSessions, mysql, resultView, provider) {
     async () => {
       try {
         const started = Date.now();
-        const maxRows = getMaxRows();
+        const maxRows = consoleContext?.connection
+          ? consoleSessions.getSavedRowLimit(connection.id)
+          : getMaxRows();
         const resultSets = await mysql.query(connection, appendLimitHint(sql, maxRows), schema);
         resultView.show(`${connection.name} Results`, {
           kind: 'query',
@@ -1311,6 +1499,13 @@ function getSelectedOrFullText(editor) {
   return editor.document.getText();
 }
 
+function hasRunnableSql(sql) {
+  return String(sql || '')
+    .replace(/--[^\r\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .trim().length > 0;
+}
+
 function appendLimitHint(sql, maxRows) {
   if (maxRows === NO_ROW_LIMIT || maxRows === undefined || maxRows === null) {
     return sql;
@@ -1404,6 +1599,681 @@ function formatResultHeader(header) {
     parts.push(`${header.warningStatus} warning${header.warningStatus === 1 ? '' : 's'}`);
   }
   return parts.join(', ') || 'Statement executed successfully.';
+}
+
+async function exportQueryResultSet(result, resultSetIndex, format) {
+  const normalizedFormat = String(format || '').toLowerCase();
+  const exporter = EXPORT_FORMATS[normalizedFormat];
+  const setIndex = Number(resultSetIndex);
+  const resultSet = result?.kind === 'query' && Number.isInteger(setIndex)
+    ? result.resultSets?.[setIndex]
+    : undefined;
+
+  if (!exporter || !resultSet) {
+    vscode.window.showWarningMessage('No query result data is available to export.');
+    return;
+  }
+
+  if (!Array.isArray(resultSet.rows) || resultSet.rows.length === 0) {
+    vscode.window.showInformationMessage('This result set has no rows to export.');
+    return;
+  }
+
+  const content = exporter.serialize(resultSet.rows);
+  const uri = await vscode.window.showSaveDialog({
+    defaultUri: defaultExportUri(result, setIndex, exporter.extension),
+    filters: {
+      [exporter.label]: [exporter.extension]
+    },
+    saveLabel: `Export ${exporter.label}`
+  });
+
+  if (!uri) {
+    return;
+  }
+
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+  vscode.window.showInformationMessage(`Exported ${resultSet.rows.length} row${resultSet.rows.length === 1 ? '' : 's'} to ${uri.fsPath}.`);
+}
+
+const EXPORT_FORMATS = {
+  csv: {
+    label: 'CSV',
+    extension: 'csv',
+    serialize: serializeRowsAsCsv
+  },
+  json: {
+    label: 'JSON',
+    extension: 'json',
+    serialize: serializeRowsAsJson
+  },
+  markdown: {
+    label: 'Markdown',
+    extension: 'md',
+    serialize: serializeRowsAsMarkdown
+  }
+};
+
+function defaultExportUri(result, resultSetIndex, extension) {
+  const fileName = `${sanitizeFileName([
+    result?.connection?.name || 'query',
+    result?.schema,
+    `result-${resultSetIndex + 1}`
+  ].filter(Boolean).join('-'))}.${extension}`;
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+  return folder
+    ? vscode.Uri.joinPath(folder, fileName)
+    : vscode.Uri.file(path.join(os.homedir(), fileName));
+}
+
+function sanitizeFileName(value) {
+  return String(value || 'query-results')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 120) || 'query-results';
+}
+
+function serializeRowsAsCsv(rows) {
+  const columns = collectRowColumns(rows);
+  const lines = [
+    columns.map(csvCell).join(','),
+    ...rows.map((row) => columns.map((column) => csvCell(formatDelimitedExportValue(row[column]))).join(','))
+  ];
+  return `${lines.join('\r\n')}\r\n`;
+}
+
+function csvCell(value) {
+  const text = String(value ?? '');
+  return /[",\r\n]/.test(text)
+    ? `"${text.replace(/"/g, '""')}"`
+    : text;
+}
+
+function serializeRowsAsJson(rows) {
+  return `${JSON.stringify(rows.map(normalizeExportRow), null, 2)}\n`;
+}
+
+function serializeRowsAsMarkdown(rows) {
+  const columns = collectRowColumns(rows);
+  const header = `| ${columns.map(markdownCell).join(' | ')} |`;
+  const divider = `| ${columns.map(() => '---').join(' | ')} |`;
+  const body = rows.map((row) => `| ${columns.map((column) => markdownCell(formatMarkdownExportValue(row[column]))).join(' | ')} |`);
+  return `${[header, divider, ...body].join('\n')}\n`;
+}
+
+function collectRowColumns(rows) {
+  return Array.from(rows.reduce((keys, row) => {
+    Object.keys(row || {}).forEach((key) => keys.add(key));
+    return keys;
+  }, new Set()));
+}
+
+function normalizeExportRow(row) {
+  return collectRowColumns([row]).reduce((normalized, column) => {
+    normalized[column] = normalizeExportValue(row[column]);
+    return normalized;
+  }, {});
+}
+
+function normalizeExportValue(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (Buffer.isBuffer(value)) {
+    return value.toString('base64');
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalizeExportValue);
+  }
+  if (typeof value === 'object') {
+    return Object.entries(value).reduce((normalized, [key, nestedValue]) => {
+      normalized[key] = normalizeExportValue(nestedValue);
+      return normalized;
+    }, {});
+  }
+  return value;
+}
+
+function formatDelimitedExportValue(value) {
+  const normalized = normalizeExportValue(value);
+  if (normalized === null) {
+    return '';
+  }
+  if (typeof normalized === 'object') {
+    return JSON.stringify(normalized);
+  }
+  return String(normalized);
+}
+
+function formatMarkdownExportValue(value) {
+  const normalized = normalizeExportValue(value);
+  if (normalized === null) {
+    return 'NULL';
+  }
+  if (typeof normalized === 'object') {
+    return JSON.stringify(normalized);
+  }
+  return String(normalized);
+}
+
+function markdownCell(value) {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/\r?\n/g, '<br>');
+}
+
+function buildCompletionMetadata(schema, rows) {
+  const metadata = emptyCompletionMetadata(schema);
+  for (const row of rows) {
+    if (!row.tableName) {
+      continue;
+    }
+
+    const key = row.tableName.toLowerCase();
+    let object = metadata.byLowerName.get(key);
+    if (!object) {
+      object = {
+        name: row.tableName,
+        type: row.objectType || 'table',
+        columns: []
+      };
+      metadata.objects.push(object);
+      metadata.byLowerName.set(key, object);
+    }
+
+    if (row.columnName) {
+      object.columns.push({
+        name: row.columnName,
+        type: row.columnType,
+        nullable: row.nullable,
+        columnKey: row.columnKey,
+        extra: row.extra,
+        ordinal: row.ordinal
+      });
+    }
+  }
+  return metadata;
+}
+
+function emptyCompletionMetadata(schema) {
+  return {
+    schema,
+    objects: [],
+    byLowerName: new Map()
+  };
+}
+
+function buildSqlCompletionList(document, position, sql, offset, metadata) {
+  const statement = currentSqlStatement(sql, offset);
+  const before = sql.slice(statement.start, offset);
+  const range = completionWordRange(document, position);
+  const references = extractTableReferences(statement.text, metadata);
+  const memberContext = getMemberCompletionContext(before);
+
+  if (memberContext) {
+    const object = objectForQualifier(memberContext.qualifier, references, metadata);
+    if (object) {
+      return completionList(columnCompletionItems(object, range));
+    }
+  }
+
+  if (isTableCompletionContext(before)) {
+    return completionList(tableCompletionItems(metadata, range));
+  }
+
+  return completionList([
+    ...aliasCompletionItems(references, range),
+    ...referenceColumnCompletionItems(references, range)
+  ]);
+}
+
+function buildSqlCompletionSuggestions(sql, offset, metadata) {
+  const safeOffset = clampOffset(offset, sql);
+  const statement = currentSqlStatement(sql, safeOffset);
+  const before = sql.slice(statement.start, safeOffset);
+  const replacement = completionTextRange(sql, safeOffset);
+  const references = extractTableReferences(statement.text, metadata);
+  const memberContext = getMemberCompletionContext(before);
+  let items = [];
+
+  if (memberContext) {
+    const object = objectForQualifier(memberContext.qualifier, references, metadata);
+    if (object) {
+      items = columnCompletionSuggestions(object);
+    }
+  } else if (isTableCompletionContext(before)) {
+    items = tableCompletionSuggestions(metadata);
+  } else {
+    items = [
+      ...aliasCompletionSuggestions(references),
+      ...referenceColumnCompletionSuggestions(references)
+    ];
+  }
+
+  return {
+    replaceStart: replacement.start,
+    replaceEnd: replacement.end,
+    items: filterCompletionSuggestions(items, replacement.prefix).slice(0, 80)
+  };
+}
+
+function completionList(items) {
+  return items.length ? new vscode.CompletionList(items, false) : undefined;
+}
+
+function currentSqlStatement(sql, offset) {
+  const start = sql.lastIndexOf(';', Math.max(0, offset - 1)) + 1;
+  const nextSemicolon = sql.indexOf(';', offset);
+  const end = nextSemicolon === -1 ? sql.length : nextSemicolon;
+  return {
+    start,
+    end,
+    text: sql.slice(start, end)
+  };
+}
+
+function completionWordRange(document, position) {
+  return document.getWordRangeAtPosition(position, /`?[\w$]*`?/) || new vscode.Range(position, position);
+}
+
+function completionTextRange(sql, offset) {
+  const text = String(sql || '');
+  const safeOffset = clampOffset(offset, text);
+  let start = safeOffset;
+  let end = safeOffset;
+
+  while (start > 0 && /[\w$`]/.test(text[start - 1])) {
+    start -= 1;
+  }
+  while (end < text.length && /[\w$`]/.test(text[end])) {
+    end += 1;
+  }
+
+  return {
+    start,
+    end,
+    prefix: text.slice(start, safeOffset)
+  };
+}
+
+function tableCompletionItems(metadata, range) {
+  return metadata.objects.map((object) => {
+    const item = new vscode.CompletionItem(object.name, object.type === 'view'
+      ? vscode.CompletionItemKind.Interface
+      : vscode.CompletionItemKind.Struct);
+    item.detail = `${metadata.schema}.${object.name} ${object.type}`;
+    item.insertText = formatSqlIdentifier(object.name);
+    item.range = range;
+    item.sortText = `1:${object.name}`;
+    return item;
+  });
+}
+
+function tableCompletionSuggestions(metadata) {
+  return metadata.objects.map((object) => ({
+    label: object.name,
+    kind: object.type === 'view' ? 'view' : 'table',
+    detail: `${metadata.schema}.${object.name} ${object.type}`,
+    insertText: formatSqlIdentifier(object.name),
+    filterText: object.name,
+    sortText: `1:${object.name}`
+  }));
+}
+
+function aliasCompletionItems(references, range) {
+  const seen = new Set();
+  const items = [];
+  for (const reference of references) {
+    if (!reference.alias || reference.alias === reference.tableName || seen.has(reference.alias.toLowerCase())) {
+      continue;
+    }
+    seen.add(reference.alias.toLowerCase());
+    const item = new vscode.CompletionItem(reference.alias, vscode.CompletionItemKind.Variable);
+    item.detail = `Alias for ${reference.tableName}`;
+    item.insertText = formatSqlIdentifier(reference.alias);
+    item.range = range;
+    item.sortText = `0:${reference.alias}`;
+    items.push(item);
+  }
+  return items;
+}
+
+function aliasCompletionSuggestions(references) {
+  const seen = new Set();
+  const items = [];
+  for (const reference of references) {
+    if (!reference.alias || reference.alias === reference.tableName || seen.has(reference.alias.toLowerCase())) {
+      continue;
+    }
+    seen.add(reference.alias.toLowerCase());
+    items.push({
+      label: reference.alias,
+      kind: 'alias',
+      detail: `Alias for ${reference.tableName}`,
+      insertText: formatSqlIdentifier(reference.alias),
+      filterText: reference.alias,
+      sortText: `0:${reference.alias}`
+    });
+  }
+  return items;
+}
+
+function referenceColumnCompletionItems(references, range) {
+  const items = [];
+  const seen = new Set();
+  for (const reference of references) {
+    if (!reference.object) {
+      continue;
+    }
+
+    const qualifier = reference.alias || reference.tableName;
+    for (const column of reference.object.columns) {
+      const key = `${qualifier.toLowerCase()}.${column.name.toLowerCase()}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      items.push(columnCompletionItem(reference.object, column, range, qualifier));
+    }
+  }
+
+  if (references.length === 1 && references[0].object) {
+    for (const column of references[0].object.columns) {
+      const key = column.name.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      items.push(columnCompletionItem(references[0].object, column, range));
+    }
+  }
+
+  return items;
+}
+
+function referenceColumnCompletionSuggestions(references) {
+  const items = [];
+  const seen = new Set();
+  for (const reference of references) {
+    if (!reference.object) {
+      continue;
+    }
+
+    const qualifier = reference.alias || reference.tableName;
+    for (const column of reference.object.columns) {
+      const key = `${qualifier.toLowerCase()}.${column.name.toLowerCase()}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      items.push(columnCompletionSuggestion(reference.object, column, qualifier));
+    }
+  }
+
+  if (references.length === 1 && references[0].object) {
+    for (const column of references[0].object.columns) {
+      const key = column.name.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      items.push(columnCompletionSuggestion(references[0].object, column));
+    }
+  }
+
+  return items;
+}
+
+function columnCompletionItems(object, range) {
+  return object.columns.map((column) => columnCompletionItem(object, column, range));
+}
+
+function columnCompletionSuggestions(object) {
+  return object.columns.map((column) => columnCompletionSuggestion(object, column));
+}
+
+function columnCompletionItem(object, column, range, qualifier) {
+  const label = qualifier ? `${qualifier}.${column.name}` : column.name;
+  const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Field);
+  item.detail = [object.name, column.type].filter(Boolean).join(' ');
+  item.documentation = formatColumnDescription(column) || undefined;
+  item.insertText = qualifier
+    ? `${formatSqlIdentifier(qualifier)}.${formatSqlIdentifier(column.name)}`
+    : formatSqlIdentifier(column.name);
+  item.range = range;
+  item.sortText = qualifier ? `2:${label}` : `1:${label}`;
+  return item;
+}
+
+function columnCompletionSuggestion(object, column, qualifier) {
+  const label = qualifier ? `${qualifier}.${column.name}` : column.name;
+  return {
+    label,
+    kind: 'column',
+    detail: [object.name, column.type].filter(Boolean).join(' '),
+    documentation: formatColumnDescription(column) || '',
+    insertText: qualifier
+      ? `${formatSqlIdentifier(qualifier)}.${formatSqlIdentifier(column.name)}`
+      : formatSqlIdentifier(column.name),
+    filterText: column.name,
+    sortText: qualifier ? `2:${label}` : `1:${label}`
+  };
+}
+
+function filterCompletionSuggestions(items, prefix) {
+  const normalizedPrefix = normalizeCompletionFilterText(prefix);
+  const filtered = normalizedPrefix
+    ? items.filter((item) => normalizeCompletionFilterText(item.filterText || item.label).startsWith(normalizedPrefix))
+    : items;
+  return filtered.sort((left, right) => {
+    const sort = String(left.sortText || left.label).localeCompare(String(right.sortText || right.label));
+    return sort || String(left.label).localeCompare(String(right.label));
+  });
+}
+
+function normalizeCompletionFilterText(value) {
+  return unquoteIdentifier(String(value || '').replace(/^`/, '').replace(/`$/, '')).toLowerCase();
+}
+
+function clampOffset(offset, text) {
+  const value = Number(offset);
+  const length = String(text || '').length;
+  if (!Number.isFinite(value)) {
+    return length;
+  }
+  return Math.max(0, Math.min(length, Math.trunc(value)));
+}
+
+function extractTableReferences(sql, metadata) {
+  const masked = maskSqlLiteralsAndComments(sql);
+  const references = [];
+  const seen = new Set();
+  const identifier = sqlIdentifierPatternSource();
+  const qualified = qualifiedSqlIdentifierPatternSource();
+  const directPattern = new RegExp(`\\b(?:from|join|update|into)\\s+(${qualified})(?:\\s+(?:as\\s+)?(${identifier}))?`, 'gi');
+  let match;
+
+  while ((match = directPattern.exec(masked))) {
+    addTableReference(references, seen, metadata, match[1], match[2]);
+  }
+
+  const fromPattern = /\bfrom\b([\s\S]*?)(?=\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|\bunion\b|;|$)/gi;
+  while ((match = fromPattern.exec(masked))) {
+    const segments = match[1].split(',');
+    for (const segment of segments) {
+      const beforeJoin = segment.split(/\b(?:inner|left|right|full|cross)?\s*join\b/i)[0];
+      const beforeOn = beforeJoin.split(/\bon\b/i)[0].trim();
+      const segmentMatch = beforeOn.match(new RegExp(`^(${qualified})(?:\\s+(?:as\\s+)?(${identifier}))?`, 'i'));
+      if (segmentMatch) {
+        addTableReference(references, seen, metadata, segmentMatch[1], segmentMatch[2]);
+      }
+    }
+  }
+
+  return references;
+}
+
+function addTableReference(references, seen, metadata, qualifiedName, aliasName) {
+  const parts = splitQualifiedIdentifier(qualifiedName);
+  const tableName = parts[parts.length - 1];
+  if (!tableName || isSqlReservedIdentifier(tableName)) {
+    return;
+  }
+
+  const alias = normalizeSqlAlias(aliasName);
+  const object = objectForTableName(tableName, metadata);
+  const key = `${tableName.toLowerCase()}:${(alias || tableName).toLowerCase()}`;
+  if (seen.has(key)) {
+    return;
+  }
+  seen.add(key);
+  references.push({
+    tableName,
+    alias: alias || tableName,
+    object
+  });
+}
+
+function normalizeSqlAlias(aliasName) {
+  if (!aliasName) {
+    return '';
+  }
+  const alias = unquoteIdentifier(aliasName);
+  return alias && !isSqlReservedIdentifier(alias) ? alias : '';
+}
+
+function objectForQualifier(qualifier, references, metadata) {
+  const normalized = unquoteIdentifier(qualifier).toLowerCase();
+  const reference = references.find((candidate) => (
+    candidate.alias?.toLowerCase() === normalized ||
+    candidate.tableName.toLowerCase() === normalized
+  ));
+  return reference?.object || objectForTableName(qualifier, metadata);
+}
+
+function objectForTableName(tableName, metadata) {
+  return metadata.byLowerName.get(unquoteIdentifier(tableName).toLowerCase());
+}
+
+function getMemberCompletionContext(sqlBefore) {
+  const masked = maskSqlLiteralsAndComments(sqlBefore);
+  const match = masked.match(/(`(?:``|[^`])*`|[A-Za-z_][\w$]*)\s*\.\s*(?:`[^`]*|[A-Za-z_][\w$]*)?$/);
+  return match ? { qualifier: unquoteIdentifier(match[1]) } : undefined;
+}
+
+function isTableCompletionContext(sqlBefore) {
+  const masked = maskSqlLiteralsAndComments(sqlBefore);
+  const tail = masked.slice(-500);
+  if (/\b(?:from|join|update|into)\s+[\w$`.]*$/i.test(tail)) {
+    return true;
+  }
+
+  const lastComma = tail.lastIndexOf(',');
+  if (lastComma === -1 || !/,\s*[\w$`]*$/i.test(tail)) {
+    return false;
+  }
+
+  const lastFrom = lastKeywordIndex(tail, ['from']);
+  const lastBlockingClause = lastKeywordIndex(tail, ['where', 'group', 'order', 'having', 'limit', 'on']);
+  return lastComma > lastFrom && lastComma > lastBlockingClause;
+}
+
+function lastKeywordIndex(text, keywords) {
+  return keywords.reduce((last, keyword) => {
+    const pattern = new RegExp(`\\b${escapeRegExp(keyword)}\\b`, 'gi');
+    let match;
+    let next = last;
+    while ((match = pattern.exec(text))) {
+      next = Math.max(next, match.index);
+    }
+    return next;
+  }, -1);
+}
+
+function sqlIdentifierPatternSource() {
+  return '`(?:``|[^`])*`|[A-Za-z_][\\w$]*';
+}
+
+function qualifiedSqlIdentifierPatternSource() {
+  const identifier = sqlIdentifierPatternSource();
+  return `(?:${identifier})(?:\\s*\\.\\s*(?:${identifier}))?`;
+}
+
+function splitQualifiedIdentifier(value) {
+  const parts = [];
+  let current = '';
+  let inBacktick = false;
+  const text = String(value || '').trim();
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === '`') {
+      current += char;
+      if (inBacktick && text[index + 1] === '`') {
+        current += text[index + 1];
+        index += 1;
+        continue;
+      }
+      inBacktick = !inBacktick;
+      continue;
+    }
+    if (char === '.' && !inBacktick) {
+      parts.push(unquoteIdentifier(current));
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+
+  if (current) {
+    parts.push(unquoteIdentifier(current));
+  }
+  return parts.filter(Boolean);
+}
+
+function unquoteIdentifier(value) {
+  const text = String(value || '').trim();
+  if (text.startsWith('`')) {
+    const end = text.endsWith('`') ? text.length - 1 : text.length;
+    return text.slice(1, end).replace(/``/g, '`');
+  }
+  return text;
+}
+
+function formatSqlIdentifier(value) {
+  const text = String(value || '');
+  return /^[A-Za-z_][\w$]*$/.test(text) && !isSqlReservedIdentifier(text)
+    ? text
+    : quoteIdentifier(text);
+}
+
+function isSqlReservedIdentifier(value) {
+  return SQL_RESERVED_WORDS.has(String(value || '').toLowerCase());
+}
+
+function maskSqlLiteralsAndComments(sql) {
+  return String(sql || '')
+    .replace(/--[^\r\n]*/g, blankSqlMatch)
+    .replace(/\/\*[\s\S]*?\*\//g, blankSqlMatch)
+    .replace(/'(?:''|\\.|[^'\\])*'/g, blankSqlMatch)
+    .replace(/"(?:\\"|""|[^"])*"/g, blankSqlMatch);
+}
+
+function blankSqlMatch(value) {
+  return value.replace(/[^\r\n]/g, ' ');
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function prioritizeDefaultSchema(rows, defaultSchema) {
@@ -1573,6 +2443,17 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       --button-hover: var(--vscode-button-hoverBackground);
       --error: var(--vscode-errorForeground);
       --success: var(--vscode-testing-iconPassed);
+      --suggest-bg: var(--vscode-editorSuggestWidget-background);
+      --suggest-fg: var(--vscode-editorSuggestWidget-foreground);
+      --suggest-border: var(--vscode-editorSuggestWidget-border);
+      --suggest-selected: var(--vscode-editorSuggestWidget-selectedBackground);
+      --sql-keyword: var(--vscode-symbolIcon-keywordForeground, #569cd6);
+      --sql-function: var(--vscode-symbolIcon-functionForeground, #dcdcaa);
+      --sql-string: var(--vscode-symbolIcon-stringForeground, #ce9178);
+      --sql-number: var(--vscode-symbolIcon-numberForeground, #b5cea8);
+      --sql-comment: var(--vscode-descriptionForeground);
+      --sql-identifier: var(--vscode-symbolIcon-variableForeground, #9cdcfe);
+      --sql-operator: var(--vscode-symbolIcon-operatorForeground, #d4d4d4);
     }
     body {
       margin: 0;
@@ -1628,17 +2509,125 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       min-height: 30px;
       padding: 4px 8px;
     }
-    textarea {
+    .editor-wrap {
+      min-height: 0;
+      position: relative;
+      overflow: hidden;
+      border-bottom: 1px solid var(--border);
+      background: var(--input-bg);
+    }
+    .sql-highlight, textarea {
+      box-sizing: border-box;
       width: 100%;
       height: 100%;
-      resize: none;
-      border: 0;
-      border-bottom: 1px solid var(--border);
-      border-radius: 0;
+      margin: 0;
       padding: 12px;
       font-family: var(--vscode-editor-font-family);
       font-size: var(--vscode-editor-font-size);
       line-height: 1.45;
+      tab-size: 2;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+    }
+    .sql-highlight {
+      position: absolute;
+      inset: 0;
+      overflow: auto;
+      border: 0;
+      color: var(--input-fg);
+      background: transparent;
+      pointer-events: none;
+      user-select: none;
+      scrollbar-width: none;
+    }
+    .sql-highlight::-webkit-scrollbar {
+      display: none;
+    }
+    textarea {
+      position: relative;
+      z-index: 1;
+      resize: none;
+      border: 0;
+      border-radius: 0;
+      color: transparent;
+      background: transparent;
+      caret-color: var(--input-fg);
+      -webkit-text-fill-color: transparent;
+    }
+    textarea::selection {
+      background: var(--vscode-editor-selectionBackground);
+    }
+    .sql-token.keyword {
+      color: var(--sql-keyword);
+      font-weight: 600;
+    }
+    .sql-token.function {
+      color: var(--sql-function);
+    }
+    .sql-token.string {
+      color: var(--sql-string);
+    }
+    .sql-token.number {
+      color: var(--sql-number);
+    }
+    .sql-token.comment {
+      color: var(--sql-comment);
+      font-style: italic;
+    }
+    .sql-token.identifier {
+      color: var(--sql-identifier);
+    }
+    .sql-token.operator {
+      color: var(--sql-operator);
+    }
+    .completion-list {
+      position: fixed;
+      z-index: 20;
+      box-sizing: border-box;
+      min-width: 260px;
+      max-width: min(560px, calc(100vw - 24px));
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid var(--suggest-border);
+      color: var(--suggest-fg);
+      background: var(--suggest-bg);
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+    }
+    .completion-list[hidden] {
+      display: none;
+    }
+    .completion-item {
+      display: grid;
+      grid-template-columns: 58px minmax(0, 1fr);
+      gap: 8px;
+      width: 100%;
+      padding: 5px 8px;
+      box-sizing: border-box;
+      cursor: default;
+    }
+    .completion-item.active {
+      background: var(--suggest-selected);
+    }
+    .completion-kind {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    .completion-main {
+      min-width: 0;
+    }
+    .completion-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .completion-detail {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     select:focus, textarea:focus {
       outline: 1px solid var(--vscode-focusBorder);
@@ -1715,9 +2704,34 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       background: var(--bg-soft);
     }
     .block-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
       border-bottom: 1px solid var(--border);
       padding: 8px 10px;
       font-weight: 600;
+    }
+    .export-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    .export-button {
+      min-height: 22px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 7px;
+      color: var(--vscode-button-secondaryForeground);
+      background: var(--vscode-button-secondaryBackground);
+      font: inherit;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .export-button:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
     }
     .scroller {
       overflow: auto;
@@ -1792,7 +2806,11 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       <button id="run" type="button">Run</button>
       <button id="clear" class="secondary" type="button">Clear</button>
     </section>
-    <textarea id="sql" spellcheck="false">${escapeHtml(sql)}</textarea>
+    <div class="editor-wrap">
+      <pre id="sql-highlight" class="sql-highlight" aria-hidden="true"></pre>
+      <textarea id="sql" spellcheck="false">${escapeHtml(sql)}</textarea>
+      <div id="completion-list" class="completion-list" role="listbox" hidden></div>
+    </div>
     <div id="status" class="${initialStatusClass}" role="status" aria-live="polite">${initialStatus}</div>
     <section id="results" class="results"></section>
   </main>
@@ -1801,10 +2819,21 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     const schema = document.getElementById('schema');
     const rowLimit = document.getElementById('row-limit');
     const sql = document.getElementById('sql');
+    const sqlHighlight = document.getElementById('sql-highlight');
     const run = document.getElementById('run');
     const clear = document.getElementById('clear');
     const status = document.getElementById('status');
     const results = document.getElementById('results');
+    const completionList = document.getElementById('completion-list');
+    let saveTimer;
+    let completionTimer;
+    let completionRequestId = 0;
+    let completionState = {
+      items: [],
+      selectedIndex: 0,
+      replaceStart: 0,
+      replaceEnd: 0
+    };
 
     function setBusy(isBusy) {
       run.disabled = isBusy;
@@ -1818,44 +2847,695 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       status.textContent = message || '';
     }
 
-    function execute() {
-      setBusy(true);
-      setStatus('busy', 'Running...');
-      vscode.postMessage({
-        command: 'run',
+    function snapshot() {
+      return {
         schema: schema.value,
         rowLimit: rowLimit.value,
         sql: sql.value
+      };
+    }
+
+    const SQL_INDENT = '  ';
+    const SQL_HIGHLIGHT_KEYWORDS = new Set('add all alter and as asc between by case create cross delete desc distinct drop else end exists from full group having in inner insert into is join left like limit not null on or order outer right select set then union update values when where with table view primary key foreign references index unique constraint database schema if begin commit rollback transaction'.split(' '));
+    const SQL_HIGHLIGHT_FUNCTIONS = new Set('avg coalesce concat count curdate date_format ifnull lower max min now nullif round sum upper'.split(' '));
+
+    function handleSqlChanged(options = {}) {
+      updateHighlight();
+      window.clearTimeout(saveTimer);
+      vscode.setState(snapshot());
+      saveTimer = window.setTimeout(() => post('sqlChanged'), 250);
+      hideCompletion();
+      if (options.complete !== false) {
+        requestCompletionSoon();
+      }
+    }
+
+    function updateHighlight() {
+      sqlHighlight.innerHTML = highlightSql(sql.value);
+      syncHighlightScroll();
+    }
+
+    function syncHighlightScroll() {
+      sqlHighlight.scrollTop = sql.scrollTop;
+      sqlHighlight.scrollLeft = sql.scrollLeft;
+    }
+
+    function highlightSql(source) {
+      const text = String(source || '');
+      let html = '';
+      let index = 0;
+
+      while (index < text.length) {
+        const char = text[index];
+        const next = text[index + 1];
+
+        if (char === '-' && next === '-') {
+          const end = readLineComment(text, index);
+          html += highlightToken(text.slice(index, end), 'comment');
+          index = end;
+          continue;
+        }
+
+        if (char === '#') {
+          const end = readLineComment(text, index);
+          html += highlightToken(text.slice(index, end), 'comment');
+          index = end;
+          continue;
+        }
+
+        if (char === '/' && next === '*') {
+          const end = readBlockComment(text, index);
+          html += highlightToken(text.slice(index, end), 'comment');
+          index = end;
+          continue;
+        }
+
+        if (char === "'" || char === '"') {
+          const end = readQuoted(text, index, char);
+          html += highlightToken(text.slice(index, end), 'string');
+          index = end;
+          continue;
+        }
+
+        if (char === '\`') {
+          const end = readQuoted(text, index, char);
+          html += highlightToken(text.slice(index, end), 'identifier');
+          index = end;
+          continue;
+        }
+
+        if (isDigit(char)) {
+          const end = readNumber(text, index);
+          html += highlightToken(text.slice(index, end), 'number');
+          index = end;
+          continue;
+        }
+
+        if (isWordStart(char)) {
+          const end = readWord(text, index);
+          const word = text.slice(index, end);
+          const lower = word.toLowerCase();
+          const tokenClass = SQL_HIGHLIGHT_KEYWORDS.has(lower)
+            ? 'keyword'
+            : SQL_HIGHLIGHT_FUNCTIONS.has(lower) && nextNonSpace(text, end) === '('
+              ? 'function'
+              : '';
+          html += tokenClass ? highlightToken(word, tokenClass) : escapeHighlightHtml(word);
+          index = end;
+          continue;
+        }
+
+        if ('()[],.;=*<>!+-/%'.includes(char)) {
+          html += highlightToken(char, 'operator');
+          index += 1;
+          continue;
+        }
+
+        html += escapeHighlightHtml(char);
+        index += 1;
+      }
+
+      if (!html) {
+        return ' ';
+      }
+      return text.endsWith('\\n') ? html + ' ' : html;
+    }
+
+    function highlightToken(value, tokenClass) {
+      return '<span class="sql-token ' + tokenClass + '">' + escapeHighlightHtml(value) + '</span>';
+    }
+
+    function escapeHighlightHtml(value) {
+      const text = String(value || '');
+      let escaped = '';
+      for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        if (char === '&') {
+          escaped += '&amp;';
+        } else if (char === '<') {
+          escaped += '&lt;';
+        } else if (char === '>') {
+          escaped += '&gt;';
+        } else if (char === '"') {
+          escaped += '&quot;';
+        } else {
+          escaped += char;
+        }
+      }
+      return escaped;
+    }
+
+    function readLineComment(text, start) {
+      let cursor = start;
+      while (cursor < text.length && text[cursor] !== '\\n') {
+        cursor += 1;
+      }
+      return cursor;
+    }
+
+    function readBlockComment(text, start) {
+      let cursor = start + 2;
+      while (cursor < text.length) {
+        if (text[cursor] === '*' && text[cursor + 1] === '/') {
+          return cursor + 2;
+        }
+        cursor += 1;
+      }
+      return text.length;
+    }
+
+    function readQuoted(text, start, quote) {
+      let cursor = start + 1;
+      while (cursor < text.length) {
+        const char = text[cursor];
+        if (char === '\\\\') {
+          cursor += 2;
+          continue;
+        }
+        if (char === quote) {
+          if (text[cursor + 1] === quote) {
+            cursor += 2;
+            continue;
+          }
+          return cursor + 1;
+        }
+        cursor += 1;
+      }
+      return text.length;
+    }
+
+    function readNumber(text, start) {
+      let cursor = start;
+      while (cursor < text.length && (isDigit(text[cursor]) || text[cursor] === '.')) {
+        cursor += 1;
+      }
+      return cursor;
+    }
+
+    function readWord(text, start) {
+      let cursor = start;
+      while (cursor < text.length && isWordPart(text[cursor])) {
+        cursor += 1;
+      }
+      return cursor;
+    }
+
+    function nextNonSpace(text, start) {
+      let cursor = start;
+      while (cursor < text.length && isInlineSpace(text[cursor])) {
+        cursor += 1;
+      }
+      return text[cursor] || '';
+    }
+
+    function isInlineSpace(char) {
+      return char === ' ' || char === '\\t';
+    }
+
+    function isDigit(char) {
+      const code = char ? char.charCodeAt(0) : 0;
+      return code >= 48 && code <= 57;
+    }
+
+    function isWordStart(char) {
+      const code = char ? char.charCodeAt(0) : 0;
+      return char === '_' || char === '$' || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+    }
+
+    function isWordPart(char) {
+      return isWordStart(char) || isDigit(char);
+    }
+
+    function insertSmartNewline() {
+      const start = sql.selectionStart;
+      const end = sql.selectionEnd;
+      const indent = nextSqlIndent(sql.value, start);
+      sql.setRangeText('\\n' + indent, start, end, 'end');
+      handleSqlChanged({ complete: false });
+    }
+
+    function nextSqlIndent(value, offset) {
+      const lineStart = value.lastIndexOf('\\n', Math.max(0, offset - 1)) + 1;
+      const line = value.slice(lineStart, offset);
+      let indent = leadingIndent(line);
+      const normalized = normalizeSqlLineForIndent(line);
+      if (shouldIndentNextSqlLine(normalized)) {
+        indent += SQL_INDENT;
+      }
+      return indent;
+    }
+
+    function leadingIndent(line) {
+      let cursor = 0;
+      while (cursor < line.length && (line[cursor] === ' ' || line[cursor] === '\\t')) {
+        cursor += 1;
+      }
+      return line.slice(0, cursor).split('\\t').join(SQL_INDENT);
+    }
+
+    function normalizeSqlLineForIndent(line) {
+      let output = '';
+      let index = 0;
+      while (index < line.length) {
+        const char = line[index];
+        const next = line[index + 1];
+        if ((char === '-' && next === '-') || char === '#') {
+          break;
+        }
+        if (char === '/' && next === '*') {
+          index = readBlockComment(line, index);
+          continue;
+        }
+        if (char === "'" || char === '"' || char === '\`') {
+          output += ' ';
+          index = readQuoted(line, index, char);
+          continue;
+        }
+        output += char;
+        index += 1;
+      }
+      return output.trim();
+    }
+
+    function shouldIndentNextSqlLine(line) {
+      const lower = line.toLowerCase();
+      if (!lower) {
+        return false;
+      }
+      if (lower.endsWith('(') || lower.endsWith(',')) {
+        return true;
+      }
+
+      const firstWord = firstSqlWord(lower);
+      if (firstWord === 'select' && !hasSqlWord(lower, 'from')) {
+        return true;
+      }
+      if (['where', 'having', 'on', 'set', 'values'].includes(firstWord)) {
+        return true;
+      }
+      return ['case', 'then', 'else', 'begin'].includes(lastSqlWord(lower));
+    }
+
+    function firstSqlWord(line) {
+      let cursor = 0;
+      while (cursor < line.length && !isWordStart(line[cursor])) {
+        cursor += 1;
+      }
+      const start = cursor;
+      while (cursor < line.length && isWordPart(line[cursor])) {
+        cursor += 1;
+      }
+      return line.slice(start, cursor);
+    }
+
+    function lastSqlWord(line) {
+      let cursor = line.length - 1;
+      while (cursor >= 0 && !isWordPart(line[cursor])) {
+        cursor -= 1;
+      }
+      const end = cursor + 1;
+      while (cursor >= 0 && isWordPart(line[cursor])) {
+        cursor -= 1;
+      }
+      return line.slice(cursor + 1, end);
+    }
+
+    function hasSqlWord(line, word) {
+      let cursor = 0;
+      while (cursor < line.length) {
+        if (!isWordStart(line[cursor])) {
+          cursor += 1;
+          continue;
+        }
+        const start = cursor;
+        while (cursor < line.length && isWordPart(line[cursor])) {
+          cursor += 1;
+        }
+        if (line.slice(start, cursor) === word) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function indentSelection(outdent) {
+      const value = sql.value;
+      const start = sql.selectionStart;
+      const end = sql.selectionEnd;
+      const selected = value.slice(start, end);
+
+      if (!selected.includes('\\n')) {
+        if (outdent) {
+          outdentCurrentLine();
+          return;
+        }
+        sql.setRangeText(SQL_INDENT, start, end, 'end');
+        handleSqlChanged({ complete: false });
+        return;
+      }
+
+      const lineStart = value.lastIndexOf('\\n', Math.max(0, start - 1)) + 1;
+      const selectedEnd = end > start && value[end - 1] === '\\n' ? end - 1 : end;
+      const nextLineBreak = value.indexOf('\\n', selectedEnd);
+      const blockEnd = nextLineBreak === -1 ? value.length : nextLineBreak;
+      const original = value.slice(lineStart, blockEnd);
+      const changed = original
+        .split('\\n')
+        .map((line) => outdent ? removeOneIndent(line) : SQL_INDENT + line)
+        .join('\\n');
+
+      sql.setRangeText(changed, lineStart, blockEnd, 'select');
+      handleSqlChanged({ complete: false });
+    }
+
+    function outdentCurrentLine() {
+      const value = sql.value;
+      const start = sql.selectionStart;
+      const end = sql.selectionEnd;
+      const lineStart = value.lastIndexOf('\\n', Math.max(0, start - 1)) + 1;
+      const nextLineBreak = value.indexOf('\\n', start);
+      const lineEnd = nextLineBreak === -1 ? value.length : nextLineBreak;
+      const line = value.slice(lineStart, lineEnd);
+      const nextLine = removeOneIndent(line);
+      const removed = line.length - nextLine.length;
+      if (!removed) {
+        return;
+      }
+
+      sql.setRangeText(nextLine, lineStart, lineEnd, 'preserve');
+      sql.selectionStart = Math.max(lineStart, start - removed);
+      sql.selectionEnd = Math.max(sql.selectionStart, end - removed);
+      handleSqlChanged({ complete: false });
+    }
+
+    function removeOneIndent(line) {
+      if (line.startsWith(SQL_INDENT)) {
+        return line.slice(SQL_INDENT.length);
+      }
+      if (line.startsWith('\\t') || line.startsWith(' ')) {
+        return line.slice(1);
+      }
+      return line;
+    }
+
+    function post(command) {
+      const state = snapshot();
+      vscode.setState(state);
+      vscode.postMessage({
+        command,
+        ...state
       });
     }
+
+    function requestCompletion() {
+      window.clearTimeout(completionTimer);
+      sendCompletionRequest(++completionRequestId);
+    }
+
+    function requestCompletionSoon() {
+      const requestId = ++completionRequestId;
+      window.clearTimeout(completionTimer);
+      completionTimer = window.setTimeout(() => sendCompletionRequest(requestId), 120);
+    }
+
+    function sendCompletionRequest(requestId) {
+      const state = snapshot();
+      vscode.setState(state);
+      vscode.postMessage({
+        command: 'completion',
+        ...state,
+        offset: sql.selectionStart,
+        requestId
+      });
+    }
+
+    function hideCompletion() {
+      window.clearTimeout(completionTimer);
+      completionList.hidden = true;
+      completionList.innerHTML = '';
+      completionState = {
+        ...completionState,
+        items: []
+      };
+    }
+
+    function showCompletion(message) {
+      if (message.requestId !== completionRequestId) {
+        return;
+      }
+
+      const items = Array.isArray(message.items) ? message.items : [];
+      if (!items.length) {
+        hideCompletion();
+        return;
+      }
+
+      completionState = {
+        items,
+        selectedIndex: 0,
+        replaceStart: Number.isInteger(message.replaceStart) ? message.replaceStart : sql.selectionStart,
+        replaceEnd: Number.isInteger(message.replaceEnd) ? message.replaceEnd : sql.selectionEnd
+      };
+      completionList.innerHTML = '';
+      items.forEach((item, index) => completionList.appendChild(renderCompletionItem(item, index)));
+      completionList.hidden = false;
+      setCompletionSelection(0);
+      positionCompletionList();
+    }
+
+    function renderCompletionItem(item, index) {
+      const row = document.createElement('div');
+      row.className = 'completion-item';
+      row.setAttribute('role', 'option');
+      row.dataset.index = String(index);
+
+      const kind = document.createElement('div');
+      kind.className = 'completion-kind';
+      kind.textContent = completionKindLabel(item.kind);
+
+      const main = document.createElement('div');
+      main.className = 'completion-main';
+
+      const label = document.createElement('div');
+      label.className = 'completion-label';
+      label.textContent = item.label || item.insertText || '';
+
+      const detail = document.createElement('div');
+      detail.className = 'completion-detail';
+      detail.textContent = item.detail || item.documentation || '';
+
+      main.appendChild(label);
+      if (detail.textContent) {
+        main.appendChild(detail);
+      }
+      row.appendChild(kind);
+      row.appendChild(main);
+      row.addEventListener('mousemove', () => setCompletionSelection(index));
+      row.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        acceptCompletion(index);
+      });
+      return row;
+    }
+
+    function completionKindLabel(kind) {
+      return {
+        alias: 'alias',
+        column: 'field',
+        table: 'table',
+        view: 'view'
+      }[kind] || 'item';
+    }
+
+    function setCompletionSelection(index) {
+      if (!completionState.items.length) {
+        return;
+      }
+      const length = completionState.items.length;
+      completionState.selectedIndex = ((index % length) + length) % length;
+      [...completionList.querySelectorAll('.completion-item')].forEach((row, rowIndex) => {
+        const active = rowIndex === completionState.selectedIndex;
+        row.classList.toggle('active', active);
+        row.setAttribute('aria-selected', active ? 'true' : 'false');
+        if (active) {
+          row.scrollIntoView({ block: 'nearest' });
+        }
+      });
+    }
+
+    function acceptCompletion(index = completionState.selectedIndex) {
+      const item = completionState.items[index];
+      if (!item) {
+        return;
+      }
+      const insertText = item.insertText || item.label || '';
+      sql.focus();
+      sql.setRangeText(insertText, completionState.replaceStart, completionState.replaceEnd, 'end');
+      handleSqlChanged({ complete: false });
+    }
+
+    function positionCompletionList() {
+      if (completionList.hidden) {
+        return;
+      }
+      const point = caretPoint(sql);
+      const width = Math.min(560, Math.max(260, completionList.offsetWidth || 260));
+      const height = Math.min(260, completionList.scrollHeight || 180);
+      const left = Math.min(Math.max(8, point.left), Math.max(8, window.innerWidth - width - 8));
+      const top = point.top + height + 8 > window.innerHeight
+        ? Math.max(8, point.top - height - 24)
+        : point.top;
+      completionList.style.left = left + 'px';
+      completionList.style.top = top + 'px';
+    }
+
+    function caretPoint(textarea) {
+      const style = window.getComputedStyle(textarea);
+      const mirror = document.createElement('div');
+      const properties = [
+        'boxSizing', 'width', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth',
+        'borderLeftWidth', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+        'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'textTransform',
+        'wordSpacing', 'textIndent', 'lineHeight'
+      ];
+      properties.forEach((property) => {
+        mirror.style[property] = style[property];
+      });
+      mirror.style.position = 'absolute';
+      mirror.style.visibility = 'hidden';
+      mirror.style.whiteSpace = 'pre-wrap';
+      mirror.style.overflowWrap = 'break-word';
+      mirror.style.top = '0';
+      mirror.style.left = '-9999px';
+      mirror.textContent = textarea.value.slice(0, textarea.selectionStart);
+
+      const marker = document.createElement('span');
+      marker.textContent = String.fromCharCode(8203);
+      mirror.appendChild(marker);
+      document.body.appendChild(mirror);
+
+      const rect = textarea.getBoundingClientRect();
+      const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.45 || 20;
+      const point = {
+        left: rect.left + marker.offsetLeft - textarea.scrollLeft,
+        top: rect.top + marker.offsetTop - textarea.scrollTop + lineHeight
+      };
+      mirror.remove();
+      return point;
+    }
+
+    function execute() {
+      setBusy(true);
+      setStatus('busy', 'Running...');
+      post('run');
+    }
+
+    const restored = vscode.getState();
+    if (restored) {
+      if (typeof restored.sql === 'string') {
+        sql.value = restored.sql;
+      }
+      if (typeof restored.schema === 'string') {
+        schema.value = restored.schema;
+      }
+      if (restored.rowLimit !== undefined) {
+        rowLimit.value = restored.rowLimit;
+      }
+    }
+    updateHighlight();
 
     run.addEventListener('click', execute);
     clear.addEventListener('click', () => {
       sql.value = '';
       results.innerHTML = '';
       setStatus('', '');
+      handleSqlChanged({ complete: false });
       sql.focus();
     });
-    schema.addEventListener('change', () => {
+    results.addEventListener('click', (event) => {
+      const button = event.target?.closest?.('[data-export-format]');
+      if (!button || !results.contains(button)) {
+        return;
+      }
+
       vscode.postMessage({
-        command: 'schemaChanged',
-        schema: schema.value,
-        rowLimit: rowLimit.value
+        command: 'exportResultSet',
+        format: button.dataset.exportFormat,
+        resultSetIndex: Number(button.dataset.resultSet)
       });
     });
+    schema.addEventListener('change', () => {
+      hideCompletion();
+      post('schemaChanged');
+    });
     rowLimit.addEventListener('change', () => {
-      vscode.postMessage({
-        command: 'rowLimitChanged',
-        schema: schema.value,
-        rowLimit: rowLimit.value
-      });
+      post('rowLimitChanged');
+    });
+    sql.addEventListener('input', () => {
+      handleSqlChanged();
+    });
+    sql.addEventListener('click', () => {
+      if (!completionList.hidden) {
+        requestCompletionSoon();
+      }
+    });
+    sql.addEventListener('scroll', () => {
+      syncHighlightScroll();
+      positionCompletionList();
+    });
+    window.addEventListener('beforeunload', () => {
+      post('sqlChanged');
     });
     sql.addEventListener('keydown', (event) => {
       if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
         event.preventDefault();
+        hideCompletion();
         execute();
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && (event.code === 'Space' || event.key === ' ')) {
+        event.preventDefault();
+        requestCompletion();
+        return;
+      }
+      if (!completionList.hidden) {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          setCompletionSelection(completionState.selectedIndex + 1);
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          setCompletionSelection(completionState.selectedIndex - 1);
+          return;
+        }
+        if (event.key === 'Enter' || event.key === 'Tab') {
+          event.preventDefault();
+          acceptCompletion();
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          hideCompletion();
+          return;
+        }
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        insertSmartNewline();
+        return;
+      }
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        indentSelection(event.shiftKey);
       }
     });
+    document.addEventListener('click', (event) => {
+      if (event.target !== sql && !completionList.contains(event.target)) {
+        hideCompletion();
+      }
+    });
+    window.addEventListener('resize', positionCompletionList);
     window.addEventListener('message', (event) => {
       const message = event.data || {};
       if (message.type === 'focus') {
@@ -1866,6 +3546,10 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
           rowLimit.value = message.rowLimit;
         }
         sql.focus();
+        return;
+      }
+      if (message.type === 'completion') {
+        showCompletion(message);
         return;
       }
       if (message.type === 'results') {
@@ -2167,7 +3851,7 @@ function renderResultHtml(result) {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style nonce="${nonce}">
     :root {
@@ -2220,9 +3904,34 @@ function renderResultHtml(result) {
       background: var(--bg-soft);
     }
     .block-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
       border-bottom: 1px solid var(--border);
       padding: 8px 10px;
       font-weight: 600;
+    }
+    .export-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    .export-button {
+      min-height: 22px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 7px;
+      color: var(--vscode-button-secondaryForeground);
+      background: var(--vscode-button-secondaryBackground);
+      font: inherit;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .export-button:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
     }
     .scroller {
       overflow: auto;
@@ -2269,6 +3978,21 @@ function renderResultHtml(result) {
   <main class="shell">
     ${body}
   </main>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    document.addEventListener('click', (event) => {
+      const button = event.target?.closest?.('[data-export-format]');
+      if (!button) {
+        return;
+      }
+
+      vscode.postMessage({
+        command: 'exportResultSet',
+        format: button.dataset.exportFormat,
+        resultSetIndex: Number(button.dataset.resultSet)
+      });
+    });
+  </script>
 </body>
 </html>`;
 }
@@ -2284,7 +4008,10 @@ function renderQueryResults(result) {
     }
 
     return `<section class="block">
-      <div class="block-title">${escapeHtml(title)} · ${set.rows.length} row${set.rows.length === 1 ? '' : 's'}</div>
+      <div class="block-title">
+        <span>${escapeHtml(title)} · ${set.rows.length} row${set.rows.length === 1 ? '' : 's'}</span>
+        ${renderExportActions(index)}
+      </div>
       <div class="scroller">${renderTable(set.rows)}</div>
     </section>`;
   }).join('');
@@ -2301,6 +4028,18 @@ function renderQueryResults(result) {
     <pre><code>${escapeHtml(result.sql)}</code></pre>
   </section>
   ${resultBlocks}`;
+}
+
+function renderExportActions(resultSetIndex) {
+  return `<div class="export-actions" aria-label="Export result set">
+    ${renderExportButton(resultSetIndex, 'csv', 'CSV')}
+    ${renderExportButton(resultSetIndex, 'json', 'JSON')}
+    ${renderExportButton(resultSetIndex, 'markdown', 'Markdown')}
+  </div>`;
+}
+
+function renderExportButton(resultSetIndex, format, label) {
+  return `<button class="export-button" type="button" data-export-format="${format}" data-result-set="${resultSetIndex}">${label}</button>`;
 }
 
 function renderObjectDetails(result) {
