@@ -1,5 +1,10 @@
 # Change Log
 
+## 0.2.0
+
+- Added optional SSH tunneling for MySQL connections with password or private key authentication.
+- Added connection editing and per-connection colors.
+
 ## 0.1.0
 
 - Added schema-aware SQL completions for table names, aliases, and columns.

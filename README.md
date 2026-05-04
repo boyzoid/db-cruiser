@@ -4,7 +4,9 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 
 ## Features
 
-- Save and manage MySQL connections from the DB Cruiser activity bar view.
+- Save, edit, and manage MySQL connections from the DB Cruiser activity bar view.
+- Connect directly or through an SSH tunnel with password or private key authentication.
+- Assign connection colors that carry into the tree, DB Cruiser tab icons, SQL console, and result/detail panels.
 - Browse schemas, tables, views, columns, keys, indexes, foreign keys, and triggers.
 - Open table data views directly from the tree.
 - Test saved connections before using them.
@@ -17,9 +19,12 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 
 1. Open the **DB Cruiser** activity bar view.
 2. Select **Add MySQL Connection**.
-3. Enter the connection name, host, port, username, password, and optional default schema.
-4. Expand the saved connection to browse available schemas and database objects.
-5. Open **SQL Console** from a connection or schema to start running queries.
+3. Enter the connection name, MySQL host, port, username, password, and optional default schema.
+4. Choose a connection color if you want a visual marker in DB Cruiser views.
+5. Enable **SSH Tunnel** when the database is only reachable through an SSH server.
+6. Use **Browse** to pick a private key file for SSH private key authentication.
+7. Expand the saved connection to browse available schemas and database objects.
+8. Open **SQL Console** from a connection or schema to start running queries.
 
 ## SQL Console
 
@@ -30,6 +35,7 @@ The SQL console opens as a DB Cruiser panel with schema and row limit controls, 
 DB Cruiser contributes these commands to VS Code:
 
 - **DB Cruiser: Add MySQL Connection**
+- **DB Cruiser: Edit Connection**
 - **DB Cruiser: Refresh**
 - **DB Cruiser: Remove Connection**
 - **DB Cruiser: Test Connection**
@@ -45,11 +51,11 @@ DB Cruiser contributes these commands to VS Code:
 
 ## Security
 
-DB Cruiser stores MySQL passwords in VS Code SecretStorage. Non-secret connection metadata is stored in VS Code's extension storage.
+DB Cruiser stores MySQL passwords, SSH passwords, and SSH key passphrases in VS Code SecretStorage. Non-secret connection metadata is stored in VS Code's extension storage.
 
 ## Requirements
 
-DB Cruiser currently supports MySQL-compatible databases. You need network access from VS Code to the target database server and database credentials with permission to inspect metadata and run the queries you choose.
+DB Cruiser currently supports MySQL-compatible databases. Direct connections need network access from VS Code to the target database server. SSH tunnel connections need network access to the SSH server plus database credentials with permission to inspect metadata and run the queries you choose.
 
 ## Feedback
 

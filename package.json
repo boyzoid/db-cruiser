@@ -2,7 +2,7 @@
   "name": "db-cruiser",
   "displayName": "DB Cruiser",
   "description": "A database explorer and SQL console for VS Code.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "stroz-dot-dev",
   "author": "The Stroz",
   "license": "MIT",
@@ -29,6 +29,7 @@
   "activationEvents": [
     "onView:dbCruiser.connections",
     "onCommand:dbCruiser.addMySqlConnection",
+    "onCommand:dbCruiser.editConnection",
     "onCommand:dbCruiser.openSqlConsole",
     "onCommand:dbCruiser.runQuery",
     "onCommand:dbCruiser.selectSchema",
@@ -73,6 +74,11 @@
         "command": "dbCruiser.removeConnection",
         "title": "DB Cruiser: Remove Connection",
         "icon": "$(trash)"
+      },
+      {
+        "command": "dbCruiser.editConnection",
+        "title": "DB Cruiser: Edit Connection",
+        "icon": "$(edit)"
       },
       {
         "command": "dbCruiser.testConnection",
@@ -135,9 +141,14 @@
           "group": "inline@2"
         },
         {
-          "command": "dbCruiser.removeConnection",
+          "command": "dbCruiser.editConnection",
           "when": "view == dbCruiser.connections && viewItem =~ /connection/",
           "group": "inline@3"
+        },
+        {
+          "command": "dbCruiser.removeConnection",
+          "when": "view == dbCruiser.connections && viewItem =~ /connection/",
+          "group": "inline@4"
         },
         {
           "command": "dbCruiser.selectTop100",
@@ -197,7 +208,8 @@
     }
   },
   "dependencies": {
-    "mysql2": "^3.0.0"
+    "mysql2": "^3.0.0",
+    "ssh2": "^1.17.0"
   },
   "scripts": {
     "lint": "node --check src/extension.js",

@@ -1,5 +1,6 @@
 const vscode = require('vscode');
 const crypto = require('crypto');
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
@@ -11,10 +12,22 @@ const CONSOLE_MARKER = '-- db-cruiser:connection=';
 const SCHEMA_MARKER = '-- db-cruiser:schema=';
 const LEGACY_CONSOLE_MARKER = '-- database-pilot:connection=';
 const MYSQL_PASSWORD_PREFIX = 'dbCruiser.mysql.password.';
+const SSH_PASSWORD_PREFIX = 'dbCruiser.ssh.password.';
+const SSH_PASSPHRASE_PREFIX = 'dbCruiser.ssh.passphrase.';
 const DEFAULT_ROW_LIMIT = 500;
 const ROW_LIMIT_OPTIONS = [5, 10, 20, 25, 100, 200, 300, 400, 500];
 const NO_ROW_LIMIT = 'none';
 const METADATA_CACHE_TTL_MS = 60 * 1000;
+const CONNECTION_COLORS = [
+  { id: 'default', label: 'Default', hex: '#8a8a8a', themeColor: undefined },
+  { id: 'blue', label: 'Blue', hex: '#3794ff', themeColor: 'charts.blue' },
+  { id: 'green', label: 'Green', hex: '#89d185', themeColor: 'charts.green' },
+  { id: 'yellow', label: 'Yellow', hex: '#cca700', themeColor: 'charts.yellow' },
+  { id: 'orange', label: 'Orange', hex: '#d18616', themeColor: 'charts.orange' },
+  { id: 'red', label: 'Red', hex: '#f14c4c', themeColor: 'charts.red' },
+  { id: 'purple', label: 'Purple', hex: '#b180d7', themeColor: 'charts.purple' }
+];
+const CONNECTION_COLOR_IDS = new Set(CONNECTION_COLORS.map((color) => color.id));
 const SQL_RESERVED_WORDS = new Set([
   'add', 'all', 'alter', 'and', 'as', 'asc', 'between', 'by', 'case', 'create', 'cross',
   'delete', 'desc', 'distinct', 'drop', 'else', 'end', 'exists', 'from', 'full', 'group',
@@ -31,10 +44,10 @@ function activate(context) {
   const consoleSessions = new ConsoleSessionStore(context);
   const mysql = new MySqlAdapter(context.secrets);
   const provider = new DatabaseTreeProvider(store, mysql);
-  const resultView = new ResultView();
+  const resultView = new ResultView(context.extensionUri);
   const sqlCompletionCache = new SqlCompletionMetadataCache(mysql);
   const sqlCompletionProvider = new SqlCompletionProvider(store, consoleSessions, sqlCompletionCache);
-  const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions, sqlCompletionCache);
+  const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions, sqlCompletionCache, context.extensionUri);
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   status.command = 'dbCruiser.selectSchema';
 
@@ -53,6 +66,7 @@ function activate(context) {
     vscode.languages.registerCompletionItemProvider({ language: 'sql' }, sqlCompletionProvider, '.', ' ', '`'),
     vscode.window.registerTreeDataProvider('dbCruiser.connections', provider),
     vscode.commands.registerCommand('dbCruiser.addMySqlConnection', () => addMySqlConnection(store, mysql, provider)),
+    vscode.commands.registerCommand('dbCruiser.editConnection', (node) => editConnection(node, store, mysql, provider)),
     vscode.commands.registerCommand('dbCruiser.refresh', () => provider.refresh()),
     vscode.commands.registerCommand('dbCruiser.removeConnection', (node) => removeConnection(node, store, provider)),
     vscode.commands.registerCommand('dbCruiser.testConnection', (node) => testConnection(node, mysql)),
@@ -99,16 +113,43 @@ class ConnectionStore {
     return this.all().find((connection) => connection.id === id);
   }
 
-  async add(connection, password) {
-    const connections = this.all().filter((saved) => saved.id !== connection.id);
-    connections.push(connection);
+  async add(connection, credentials) {
+    const connections = this.all();
+    const existingIndex = connections.findIndex((saved) => saved.id === connection.id);
+    if (existingIndex >= 0) {
+      connections[existingIndex] = connection;
+    } else {
+      connections.push(connection);
+    }
     await this.context.globalState.update(CONNECTIONS_KEY, connections);
 
-    if (password !== undefined) {
-      if (password.length > 0) {
-        await this.context.secrets.store(secretKey(connection.id), password);
+    const mysqlPassword = normalizeCredentialValue(
+      typeof credentials === 'object' && credentials !== null ? credentials.mysqlPassword : credentials
+    );
+    const sshPassword = normalizeCredentialValue(credentials?.sshPassword);
+    const sshPassphrase = normalizeCredentialValue(credentials?.sshPassphrase);
+
+    if (mysqlPassword !== undefined) {
+      if (mysqlPassword.length > 0) {
+        await this.context.secrets.store(secretKey(connection.id), mysqlPassword);
       } else {
         await this.context.secrets.delete(secretKey(connection.id));
+      }
+    }
+
+    if (sshPassword !== undefined) {
+      if (sshPassword.length > 0) {
+        await this.context.secrets.store(sshPasswordSecretKey(connection.id), sshPassword);
+      } else {
+        await this.context.secrets.delete(sshPasswordSecretKey(connection.id));
+      }
+    }
+
+    if (sshPassphrase !== undefined) {
+      if (sshPassphrase.length > 0) {
+        await this.context.secrets.store(sshPassphraseSecretKey(connection.id), sshPassphrase);
+      } else {
+        await this.context.secrets.delete(sshPassphraseSecretKey(connection.id));
       }
     }
   }
@@ -117,6 +158,8 @@ class ConnectionStore {
     const connections = this.all().filter((connection) => connection.id !== id);
     await this.context.globalState.update(CONNECTIONS_KEY, connections);
     await this.context.secrets.delete(secretKey(id));
+    await this.context.secrets.delete(sshPasswordSecretKey(id));
+    await this.context.secrets.delete(sshPassphraseSecretKey(id));
   }
 }
 
@@ -401,9 +444,9 @@ class TreeNode {
   toTreeItem() {
     if (this.kind === 'connection') {
       const item = new vscode.TreeItem(this.connection.name, vscode.TreeItemCollapsibleState.Expanded);
-      item.description = 'MySQL';
+      item.description = this.connection.ssh?.enabled ? 'MySQL via SSH' : 'MySQL';
       item.tooltip = describeConnection(this.connection);
-      item.iconPath = new vscode.ThemeIcon('server-environment');
+      item.iconPath = connectionThemeIcon('server-environment', this.connection);
       item.contextValue = 'connection mysql';
       return item;
     }
@@ -411,14 +454,14 @@ class TreeNode {
     if (this.kind === 'schema') {
       const item = new vscode.TreeItem(this.schema, vscode.TreeItemCollapsibleState.Collapsed);
       item.description = this.connection.database === this.schema ? 'default' : undefined;
-      item.iconPath = new vscode.ThemeIcon('database');
+      item.iconPath = connectionThemeIcon('database', this.connection);
       item.contextValue = 'schema';
       return item;
     }
 
     if (this.kind === 'group') {
       const item = new vscode.TreeItem(this.label, vscode.TreeItemCollapsibleState.Collapsed);
-      item.iconPath = new vscode.ThemeIcon(this.icon);
+      item.iconPath = connectionThemeIcon(this.icon, this.connection);
       item.contextValue = 'group';
       return item;
     }
@@ -426,7 +469,7 @@ class TreeNode {
     if (this.kind === 'object') {
       const item = new vscode.TreeItem(this.name, vscode.TreeItemCollapsibleState.Collapsed);
       item.description = this.schema;
-      item.iconPath = new vscode.ThemeIcon(this.objectType === 'view' ? 'eye' : 'table');
+      item.iconPath = connectionThemeIcon(this.objectType === 'view' ? 'eye' : 'table', this.connection);
       item.contextValue = `object object:${this.objectType}`;
       item.command = {
         command: this.objectType === 'table' ? 'dbCruiser.selectTop100' : 'dbCruiser.inspectObject',
@@ -438,7 +481,7 @@ class TreeNode {
 
     if (this.kind === 'objectGroup') {
       const item = new vscode.TreeItem(this.label, vscode.TreeItemCollapsibleState.Collapsed);
-      item.iconPath = new vscode.ThemeIcon(this.icon);
+      item.iconPath = connectionThemeIcon(this.icon, this.connection);
       item.contextValue = `objectGroup objectGroup:${this.group}`;
       return item;
     }
@@ -447,7 +490,7 @@ class TreeNode {
       const item = new vscode.TreeItem(this.column.name, vscode.TreeItemCollapsibleState.None);
       item.description = formatColumnDescription(this.column);
       item.tooltip = this.column.columnKey === 'PRI' ? 'Primary key' : this.column.type || 'Column';
-      item.iconPath = new vscode.ThemeIcon(this.column.columnKey === 'PRI' ? 'key' : 'symbol-field');
+      item.iconPath = connectionThemeIcon(this.column.columnKey === 'PRI' ? 'key' : 'symbol-field', this.connection);
       item.contextValue = 'column';
       return item;
     }
@@ -456,7 +499,7 @@ class TreeNode {
       const item = new vscode.TreeItem(this.key.name, vscode.TreeItemCollapsibleState.None);
       item.description = formatKeyDescription(this.key);
       item.tooltip = formatKeyTooltip(this.key);
-      item.iconPath = new vscode.ThemeIcon(this.key.type === 'PRIMARY KEY' ? 'key' : 'symbol-key');
+      item.iconPath = connectionThemeIcon(this.key.type === 'PRIMARY KEY' ? 'key' : 'symbol-key', this.connection);
       item.contextValue = 'key';
       return item;
     }
@@ -465,7 +508,7 @@ class TreeNode {
       const item = new vscode.TreeItem(this.index.name, vscode.TreeItemCollapsibleState.None);
       item.description = formatIndexDescription(this.index);
       item.tooltip = this.index.type || 'Index';
-      item.iconPath = new vscode.ThemeIcon(this.index.name === 'PRIMARY' ? 'key' : 'list-tree');
+      item.iconPath = connectionThemeIcon(this.index.name === 'PRIMARY' ? 'key' : 'list-tree', this.connection);
       item.contextValue = 'index';
       return item;
     }
@@ -474,7 +517,7 @@ class TreeNode {
       const item = new vscode.TreeItem(this.foreignKey.name, vscode.TreeItemCollapsibleState.None);
       item.description = formatForeignKeyDescription(this.foreignKey);
       item.tooltip = formatForeignKeyTooltip(this.foreignKey);
-      item.iconPath = new vscode.ThemeIcon('references');
+      item.iconPath = connectionThemeIcon('references', this.connection);
       item.contextValue = 'foreignKey';
       return item;
     }
@@ -483,7 +526,7 @@ class TreeNode {
       const item = new vscode.TreeItem(this.trigger.name, vscode.TreeItemCollapsibleState.None);
       item.description = formatTriggerDescription(this.trigger);
       item.tooltip = this.trigger.statement || 'Trigger';
-      item.iconPath = new vscode.ThemeIcon('zap');
+      item.iconPath = connectionThemeIcon('zap', this.connection);
       item.contextValue = 'trigger';
       return item;
     }
@@ -491,7 +534,7 @@ class TreeNode {
     if (this.kind === 'console') {
       const item = new vscode.TreeItem('SQL Console', vscode.TreeItemCollapsibleState.None);
       item.description = this.schema;
-      item.iconPath = new vscode.ThemeIcon('terminal');
+      item.iconPath = connectionThemeIcon('terminal', this.connection);
       item.contextValue = 'console';
       item.command = {
         command: 'dbCruiser.openSqlConsole',
@@ -522,6 +565,7 @@ class MySqlAdapter {
   constructor(secrets) {
     this.secrets = secrets;
     this.driver = undefined;
+    this.sshDriver = undefined;
   }
 
   loadDriver() {
@@ -537,17 +581,25 @@ class MySqlAdapter {
     }
   }
 
-  async connect(connection, passwordOverride, options = {}) {
-    const mysql = this.loadDriver();
-    const password = passwordOverride !== undefined
-      ? passwordOverride
-      : await this.secrets.get(secretKey(connection.id)) || '';
+  loadSshDriver() {
+    if (this.sshDriver) {
+      return this.sshDriver;
+    }
 
-    return mysql.createConnection({
-      host: connection.host,
-      port: connection.port,
+    try {
+      this.sshDriver = require('ssh2').Client;
+      return this.sshDriver;
+    } catch (error) {
+      throw new Error('SSH tunnel support needs the ssh2 package. Run npm install in this extension folder, then reload VS Code.');
+    }
+  }
+
+  async connect(connection, credentialOverride, options = {}) {
+    const mysql = this.loadDriver();
+    const credentials = await this.resolveCredentials(connection, credentialOverride);
+    const config = {
       user: connection.user,
-      password,
+      password: credentials.mysqlPassword,
       database: (options.database ?? connection.database) || undefined,
       multipleStatements: true,
       supportBigNumbers: true,
@@ -555,11 +607,115 @@ class MySqlAdapter {
       dateStrings: true,
       timezone: 'Z',
       connectTimeout: 10000
+    };
+
+    if (!connection.ssh?.enabled) {
+      return mysql.createConnection({
+        ...config,
+        host: connection.host,
+        port: connection.port
+      });
+    }
+
+    const tunnel = await this.createSshTunnel(connection, credentials);
+    try {
+      const client = await mysql.createConnection({
+        ...config,
+        stream: tunnel.stream
+      });
+      tunnel.stream.once('close', () => tunnel.ssh.end());
+      tunnel.stream.once('error', () => tunnel.ssh.end());
+      return client;
+    } catch (error) {
+      tunnel.stream.destroy();
+      tunnel.ssh.end();
+      throw error;
+    }
+  }
+
+  async resolveCredentials(connection, credentialOverride) {
+    const override = typeof credentialOverride === 'object' && credentialOverride !== null
+      ? credentialOverride
+      : { mysqlPassword: credentialOverride };
+
+    return {
+      mysqlPassword: override.mysqlPassword !== undefined
+        ? override.mysqlPassword
+        : await this.secrets.get(secretKey(connection.id)) || '',
+      sshPassword: override.sshPassword !== undefined
+        ? override.sshPassword
+        : await this.secrets.get(sshPasswordSecretKey(connection.id)) || '',
+      sshPassphrase: override.sshPassphrase !== undefined
+        ? override.sshPassphrase
+        : await this.secrets.get(sshPassphraseSecretKey(connection.id)) || ''
+    };
+  }
+
+  async createSshTunnel(connection, credentials) {
+    const Client = this.loadSshDriver();
+    const ssh = new Client();
+    const sshConfig = await this.buildSshConfig(connection, credentials);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const fail = (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        ssh.end();
+        reject(error);
+      };
+
+      ssh
+        .once('ready', () => {
+          ssh.forwardOut(
+            '127.0.0.1',
+            connection.port,
+            connection.host,
+            connection.port,
+            (error, stream) => {
+              if (error) {
+                fail(error);
+                return;
+              }
+              settled = true;
+              resolve({ ssh, stream });
+            }
+          );
+        })
+        .once('error', fail)
+        .once('end', () => fail(new Error('SSH connection ended before the MySQL tunnel was ready.')))
+        .once('close', () => fail(new Error('SSH connection closed before the MySQL tunnel was ready.')))
+        .connect(sshConfig);
     });
   }
 
-  async testConnection(connection, passwordOverride) {
-    const client = await this.connect(connection, passwordOverride, { database: undefined });
+  async buildSshConfig(connection, credentials) {
+    const ssh = connection.ssh || {};
+    const config = {
+      host: ssh.host,
+      port: ssh.port || 22,
+      username: ssh.user,
+      readyTimeout: 10000,
+      keepaliveInterval: 20000
+    };
+
+    if (ssh.authMethod === 'privateKey') {
+      config.privateKey = await fs.promises.readFile(expandHomePath(ssh.privateKeyPath), 'utf8');
+      if (credentials.sshPassphrase) {
+        config.passphrase = credentials.sshPassphrase;
+      }
+    } else {
+      config.password = credentials.sshPassword;
+    }
+
+    return config;
+  }
+
+  async testConnection(connection, credentialOverride) {
+    const client = await this.connect(connection, credentialOverride, { database: undefined });
     try {
       await client.ping();
     } finally {
@@ -793,7 +949,8 @@ class MySqlAdapter {
 }
 
 class ResultView {
-  constructor() {
+  constructor(extensionUri) {
+    this.extensionUri = extensionUri;
     this.panel = undefined;
     this.result = undefined;
   }
@@ -818,6 +975,7 @@ class ResultView {
     }
 
     this.panel.title = title;
+    this.panel.iconPath = connectionPanelIconPath(this.extensionUri, result.connection);
     this.panel.webview.html = renderResultHtml(result);
     this.panel.reveal(vscode.ViewColumn.Beside);
   }
@@ -837,10 +995,11 @@ class SqlConsoleView {
    * @param {ConsoleSessionStore} consoleSessions
    * @param {SqlCompletionMetadataCache} completionMetadataCache
    */
-  constructor(mysql, consoleSessions, completionMetadataCache) {
+  constructor(mysql, consoleSessions, completionMetadataCache, extensionUri) {
     this.mysql = mysql;
     this.consoleSessions = consoleSessions;
     this.completionMetadataCache = completionMetadataCache;
+    this.extensionUri = extensionUri;
     this.panels = new Map();
     this.panelResults = new WeakMap();
   }
@@ -856,6 +1015,7 @@ class SqlConsoleView {
     if (existing) {
       existing.panel.reveal(vscode.ViewColumn.Active);
       existing.panel.title = `${connection.name} Console`;
+      existing.panel.iconPath = connectionPanelIconPath(this.extensionUri, connection);
       await existing.panel.webview.postMessage({
         type: 'focus',
         schema: selectedSchema,
@@ -873,6 +1033,7 @@ class SqlConsoleView {
         retainContextWhenHidden: true
       }
     );
+    panel.iconPath = connectionPanelIconPath(this.extensionUri, connection);
     const disposables = [];
     let schemas = [];
     let schemaError = '';
@@ -1092,9 +1253,22 @@ class SqlCompletionProvider {
 }
 
 async function addMySqlConnection(store, mysql, provider) {
+  await openConnectionForm(store, mysql, provider);
+}
+
+async function editConnection(node, store, mysql, provider) {
+  const connection = node?.connection || await pickConnection(store);
+  if (!connection) {
+    return;
+  }
+  await openConnectionForm(store, mysql, provider, connection);
+}
+
+async function openConnectionForm(store, mysql, provider, existingConnection) {
+  const isEditing = Boolean(existingConnection);
   const panel = vscode.window.createWebviewPanel(
     'dbCruiser.connectionForm',
-    'DB Cruiser MySQL Connection',
+    isEditing ? 'Edit DB Cruiser Connection' : 'DB Cruiser MySQL Connection',
     vscode.ViewColumn.Active,
     {
       enableScripts: true,
@@ -1103,13 +1277,18 @@ async function addMySqlConnection(store, mysql, provider) {
   );
   const disposables = [];
 
-  panel.webview.html = renderConnectionFormHtml();
+  panel.webview.html = renderConnectionFormHtml({ connection: existingConnection });
   panel.webview.onDidReceiveMessage(async (message) => {
+    if (message?.command === 'pickSshKey') {
+      await pickSshKeyFile(panel, message.currentPath);
+      return;
+    }
+
     if (!message || !['test', 'save'].includes(message.command)) {
       return;
     }
 
-    const form = buildConnectionFromForm(message.values);
+    const form = buildConnectionFromForm(message.values, existingConnection);
     if (form.errors.length > 0) {
       await panel.webview.postMessage({
         type: 'status',
@@ -1120,11 +1299,11 @@ async function addMySqlConnection(store, mysql, provider) {
     }
 
     if (message.command === 'test') {
-      await testConnectionFromForm(panel, mysql, form.connection, form.password);
+      await testConnectionFromForm(panel, mysql, form.connection, form.credentials);
       return;
     }
 
-    await saveConnectionFromForm(panel, store, mysql, provider, form.connection, form.password);
+    await saveConnectionFromForm(panel, store, mysql, provider, form.connection, form.credentials, isEditing);
   }, undefined, disposables);
 
   panel.onDidDispose(() => {
@@ -1132,7 +1311,7 @@ async function addMySqlConnection(store, mysql, provider) {
   });
 }
 
-async function testConnectionFromForm(panel, mysql, connection, password) {
+async function testConnectionFromForm(panel, mysql, connection, credentials) {
   await panel.webview.postMessage({
     type: 'status',
     state: 'busy',
@@ -1140,7 +1319,7 @@ async function testConnectionFromForm(panel, mysql, connection, password) {
   });
 
   try {
-    await mysql.testConnection(connection, password);
+    await mysql.testConnection(connection, credentials);
     await panel.webview.postMessage({
       type: 'status',
       state: 'success',
@@ -1155,15 +1334,15 @@ async function testConnectionFromForm(panel, mysql, connection, password) {
   }
 }
 
-async function saveConnectionFromForm(panel, store, mysql, provider, connection, password) {
+async function saveConnectionFromForm(panel, store, mysql, provider, connection, credentials, isEditing = false) {
   await panel.webview.postMessage({
     type: 'status',
     state: 'busy',
-    message: 'Saving connection...'
+    message: isEditing ? 'Updating connection...' : 'Saving connection...'
   });
 
   try {
-    await mysql.testConnection(connection, password);
+    await mysql.testConnection(connection, credentials);
   } catch (error) {
     const choice = await vscode.window.showWarningMessage(
       `Could not connect to ${describeConnection(connection)}. ${errorMessage(error)}`,
@@ -1180,35 +1359,98 @@ async function saveConnectionFromForm(panel, store, mysql, provider, connection,
     }
   }
 
-  await store.add(connection, password);
+  await store.add(connection, credentials);
   provider.refresh();
   await panel.webview.postMessage({
     type: 'status',
     state: 'success',
-    message: `Saved ${connection.name}.`
+    message: `${isEditing ? 'Updated' : 'Saved'} ${connection.name}.`
   });
-  vscode.window.showInformationMessage(`Saved ${connection.name}.`);
+  vscode.window.showInformationMessage(`${isEditing ? 'Updated' : 'Saved'} ${connection.name}.`);
   panel.dispose();
 }
 
-function buildConnectionFromForm(values = {}) {
+async function pickSshKeyFile(panel, currentPath) {
+  const defaultPath = String(currentPath || '').trim() || path.join(os.homedir(), '.ssh');
+  const expandedPath = expandHomePath(defaultPath);
+  const defaultUri = vscode.Uri.file(defaultSshKeyPickerPath(expandedPath));
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    defaultUri,
+    openLabel: 'Use Key File',
+    title: 'Choose SSH Private Key'
+  });
+
+  if (!picked?.[0]) {
+    return;
+  }
+
+  await panel.webview.postMessage({
+    type: 'sshKeyPicked',
+    path: picked[0].fsPath
+  });
+}
+
+function defaultSshKeyPickerPath(filePath) {
+  try {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      return path.dirname(filePath);
+    }
+  } catch {
+    return path.join(os.homedir(), '.ssh');
+  }
+  return filePath;
+}
+
+function buildConnectionFromForm(values = {}, existingConnection) {
   const host = String(values.host || '').trim();
   const portText = String(values.port || '').trim();
   const user = String(values.user || '').trim();
   const database = String(values.database || '').trim();
   const nameInput = String(values.name || '').trim();
-  const password = String(values.password ?? '');
+  const mysqlPassword = String(values.password ?? '');
+  const color = normalizeConnectionColorId(values.color);
+  const sshEnabled = values.sshEnabled === true || values.sshEnabled === 'true';
+  const sshHost = String(values.sshHost || '').trim();
+  const sshPortText = String(values.sshPort || '').trim();
+  const sshUser = String(values.sshUser || '').trim();
+  const sshAuthMethod = values.sshAuthMethod === 'privateKey' ? 'privateKey' : 'password';
+  const sshPassword = String(values.sshPassword ?? '');
+  const sshPrivateKeyPath = String(values.sshPrivateKeyPath || '').trim();
+  const sshPassphrase = String(values.sshPassphrase ?? '');
   const port = Number(portText);
+  const sshPort = Number(sshPortText);
   const errors = [];
+  const isEditing = Boolean(existingConnection);
 
   if (!host) {
-    errors.push('Host is required.');
+    errors.push('MySQL host is required.');
   }
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    errors.push('Port must be between 1 and 65535.');
+    errors.push('MySQL port must be between 1 and 65535.');
   }
   if (!user) {
-    errors.push('User is required.');
+    errors.push('MySQL user is required.');
+  }
+
+  if (sshEnabled) {
+    if (!sshHost) {
+      errors.push('SSH host is required.');
+    }
+    if (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) {
+      errors.push('SSH port must be between 1 and 65535.');
+    }
+    if (!sshUser) {
+      errors.push('SSH user is required.');
+    }
+    if (sshAuthMethod === 'password' && !sshPassword && !isEditing) {
+      errors.push('SSH password is required for password authentication.');
+    }
+    if (sshAuthMethod === 'privateKey' && !sshPrivateKeyPath) {
+      errors.push('Private key path is required for private key authentication.');
+    }
   }
 
   const name = nameInput || suggestedConnectionName({ host, user, database });
@@ -1216,18 +1458,53 @@ function buildConnectionFromForm(values = {}) {
     errors.push('Connection name is required.');
   }
 
+  const connection = {
+    id: existingConnection?.id || crypto.randomUUID(),
+    type: 'mysql',
+    name,
+    host,
+    port,
+    user,
+    database: database || undefined
+  };
+  if (color !== 'default') {
+    connection.color = color;
+  }
+
+  if (sshEnabled) {
+    connection.ssh = {
+      enabled: true,
+      host: sshHost,
+      port: sshPort,
+      user: sshUser,
+      authMethod: sshAuthMethod,
+      privateKeyPath: sshAuthMethod === 'privateKey' ? sshPrivateKeyPath : undefined
+    };
+  }
+
+  const sshPasswordCredential = !sshEnabled && isEditing
+    ? ''
+    : sshEnabled && sshAuthMethod === 'password' && (!isEditing || sshPassword.length > 0)
+      ? sshPassword
+      : sshEnabled && sshAuthMethod === 'privateKey' && isEditing
+        ? ''
+        : undefined;
+  const sshPassphraseCredential = !sshEnabled && isEditing
+    ? ''
+    : sshEnabled && sshAuthMethod === 'privateKey' && (!isEditing || sshPassphrase.length > 0)
+      ? sshPassphrase
+      : sshEnabled && sshAuthMethod === 'password' && isEditing
+        ? ''
+        : undefined;
+
   return {
     errors,
-    password,
-    connection: {
-      id: crypto.randomUUID(),
-      type: 'mysql',
-      name,
-      host,
-      port,
-      user,
-      database: database || undefined
-    }
+    credentials: {
+      mysqlPassword: isEditing && mysqlPassword.length === 0 ? undefined : mysqlPassword,
+      sshPassword: sshPasswordCredential,
+      sshPassphrase: sshPassphraseCredential
+    },
+    connection
   };
 }
 
@@ -2422,6 +2699,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
   const nonce = crypto.randomBytes(16).toString('base64');
   const initialStatus = schemaError ? escapeHtml(schemaError) : '';
   const initialStatusClass = schemaError ? 'status error' : 'status';
+  const accentColor = escapeHtml(connectionAccentColor(connection));
 
   return `<!doctype html>
 <html lang="en">
@@ -2454,6 +2732,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       --sql-comment: var(--vscode-descriptionForeground);
       --sql-identifier: var(--vscode-symbolIcon-variableForeground, #9cdcfe);
       --sql-operator: var(--vscode-symbolIcon-operatorForeground, #d4d4d4);
+      --connection-color: ${accentColor};
     }
     body {
       margin: 0;
@@ -2471,6 +2750,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       display: flex;
       align-items: end;
       gap: 10px;
+      border-top: 3px solid var(--connection-color);
       border-bottom: 1px solid var(--border);
       padding: 12px;
       background: var(--bg-soft);
@@ -2480,9 +2760,18 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       margin-right: auto;
     }
     .console-title h1 {
+      display: flex;
+      align-items: center;
+      gap: 7px;
       margin: 0 0 3px;
       font-size: 14px;
       font-weight: 600;
+    }
+    .connection-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--connection-color);
     }
     .meta {
       color: var(--muted);
@@ -2682,7 +2971,9 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       align-items: flex-start;
       justify-content: space-between;
       gap: 16px;
+      border-left: 4px solid var(--connection-color);
       border-bottom: 1px solid var(--border);
+      padding-left: 12px;
       padding-bottom: 12px;
     }
     .title {
@@ -2788,7 +3079,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
   <main class="console">
     <section class="toolbar">
       <div class="console-title">
-        <h1>${escapeHtml(connection.name)}</h1>
+        <h1><span class="connection-dot" aria-hidden="true"></span>${escapeHtml(connection.name)}</h1>
         <div class="meta">${escapeHtml(describeConnection(connection))}</div>
       </div>
       <label>
@@ -3593,8 +3884,27 @@ function renderRowLimitOptions(selectedRowLimit) {
   ].join('');
 }
 
-function renderConnectionFormHtml() {
+function renderConnectionColorOptions(selectedColor) {
+  const normalizedColor = normalizeConnectionColorId(selectedColor);
+  return CONNECTION_COLORS.map((color) => {
+    const checked = color.id === normalizedColor ? ' checked' : '';
+    const dotClass = color.id === 'default' ? 'color-dot' : `color-dot color-${color.id}`;
+    return `<label class="color-option">
+      <input type="radio" name="color" value="${escapeHtml(color.id)}"${checked}>
+      <span class="color-chip"><span class="${dotClass}" aria-hidden="true"></span>${escapeHtml(color.label)}</span>
+    </label>`;
+  }).join('');
+}
+
+function renderConnectionFormHtml({ connection } = {}) {
   const nonce = crypto.randomBytes(16).toString('base64');
+  const isEditing = Boolean(connection);
+  const ssh = connection?.ssh || {};
+  const sshAuthMethod = ssh.authMethod === 'privateKey' ? 'privateKey' : 'password';
+  const selectedColor = normalizeConnectionColorId(connection?.color);
+  const title = isEditing ? 'Edit MySQL Connection' : 'MySQL Connection';
+  const saveLabel = isEditing ? 'Update Connection' : 'Save Connection';
+  const testLabel = isEditing ? 'Test Changes' : 'Test Connection';
 
   return `<!doctype html>
 <html lang="en">
@@ -3641,16 +3951,103 @@ function renderConnectionFormHtml() {
     }
     .grid {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 120px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
+    }
+    fieldset {
+      display: grid;
+      gap: 12px;
+      margin: 0;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    legend {
+      padding: 0 4px;
+      color: var(--vscode-editor-foreground);
+      font-weight: 600;
     }
     label {
       display: grid;
       gap: 6px;
+      min-width: 0;
       color: var(--vscode-editor-foreground);
       font-weight: 600;
     }
-    input {
+    .check {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .check input {
+      width: auto;
+    }
+    #sshFields {
+      display: grid;
+      gap: 12px;
+    }
+    .path-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .color-swatches {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .color-option {
+      display: inline-flex;
+      font-weight: 500;
+    }
+    .color-option input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .color-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 28px;
+      border: 1px solid var(--input-border);
+      border-radius: 4px;
+      padding: 3px 8px;
+      background: var(--input-bg);
+      cursor: pointer;
+    }
+    .color-option input:focus + .color-chip,
+    .color-option input:checked + .color-chip {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+    .color-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--vscode-icon-foreground);
+    }
+    .color-blue {
+      background: #3794ff;
+    }
+    .color-green {
+      background: #89d185;
+    }
+    .color-yellow {
+      background: #cca700;
+    }
+    .color-orange {
+      background: #d18616;
+    }
+    .color-red {
+      background: #f14c4c;
+    }
+    .color-purple {
+      background: #b180d7;
+    }
+    input,
+    select {
       width: 100%;
       box-sizing: border-box;
       border: 1px solid var(--input-border);
@@ -3661,9 +4058,13 @@ function renderConnectionFormHtml() {
       font: inherit;
       font-weight: 400;
     }
-    input:focus {
+    input:focus,
+    select:focus {
       outline: 1px solid var(--vscode-focusBorder);
       outline-offset: -1px;
+    }
+    [hidden] {
+      display: none !important;
     }
     .actions {
       display: flex;
@@ -3711,6 +4112,9 @@ function renderConnectionFormHtml() {
       .grid {
         grid-template-columns: 1fr;
       }
+      .path-row {
+        grid-template-columns: 1fr;
+      }
       .actions {
         align-items: stretch;
         flex-direction: column;
@@ -3720,39 +4124,92 @@ function renderConnectionFormHtml() {
 </head>
 <body>
   <main>
-    <h1>MySQL Connection</h1>
+    <h1>${escapeHtml(title)}</h1>
     <form>
       <div class="grid">
         <label>
-          Host
-          <input id="host" name="host" value="127.0.0.1" required autocomplete="off">
+          MySQL Host
+          <input id="host" name="host" value="${escapeHtml(connection?.host || '127.0.0.1')}" required autocomplete="off">
         </label>
         <label>
-          Port
-          <input id="port" name="port" value="3306" inputmode="numeric" pattern="[0-9]+" required autocomplete="off">
+          MySQL Port
+          <input id="port" name="port" value="${escapeHtml(connection?.port || 3306)}" inputmode="numeric" pattern="[0-9]+" required autocomplete="off">
         </label>
       </div>
       <div class="grid">
         <label>
-          User
-          <input id="user" name="user" value="root" required autocomplete="username">
+          MySQL User
+          <input id="user" name="user" value="${escapeHtml(connection?.user || 'root')}" required autocomplete="username">
         </label>
         <label>
-          Password
-          <input id="password" name="password" type="password" autocomplete="current-password">
+          MySQL Password
+          <input id="password" name="password" type="password" autocomplete="current-password" placeholder="${isEditing ? 'Leave blank to keep saved password' : ''}">
         </label>
       </div>
+      <fieldset>
+        <legend>Connection Color</legend>
+        <div class="color-swatches" role="radiogroup" aria-label="Connection color">
+          ${renderConnectionColorOptions(selectedColor)}
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>SSH Tunnel</legend>
+        <label class="check">
+          <input id="sshEnabled" name="sshEnabled" type="checkbox"${ssh.enabled ? ' checked' : ''}>
+          Use SSH Tunnel
+        </label>
+        <div id="sshFields"${ssh.enabled ? '' : ' hidden'}>
+          <div class="grid">
+            <label>
+              SSH Host
+              <input id="sshHost" name="sshHost" value="${escapeHtml(ssh.host || '')}" autocomplete="off">
+            </label>
+            <label>
+              SSH Port
+              <input id="sshPort" name="sshPort" value="${escapeHtml(ssh.port || 22)}" inputmode="numeric" pattern="[0-9]+" autocomplete="off">
+            </label>
+          </div>
+          <div class="grid">
+            <label>
+              SSH User
+              <input id="sshUser" name="sshUser" value="${escapeHtml(ssh.user || '')}" autocomplete="username">
+            </label>
+            <label>
+              SSH Auth
+              <select id="sshAuthMethod" name="sshAuthMethod">
+                <option value="password"${sshAuthMethod === 'password' ? ' selected' : ''}>Password</option>
+                <option value="privateKey"${sshAuthMethod === 'privateKey' ? ' selected' : ''}>Private Key</option>
+              </select>
+            </label>
+          </div>
+          <label id="sshPasswordLabel">
+            SSH Password
+            <input id="sshPassword" name="sshPassword" type="password" autocomplete="current-password" placeholder="${isEditing ? 'Leave blank to keep saved password' : ''}">
+          </label>
+          <label id="sshPrivateKeyPathLabel" hidden>
+            Private Key Path
+            <div class="path-row">
+              <input id="sshPrivateKeyPath" name="sshPrivateKeyPath" value="${escapeHtml(ssh.privateKeyPath || '')}" autocomplete="off">
+              <button id="pickSshKey" class="secondary" type="button">Browse</button>
+            </div>
+          </label>
+          <label id="sshPassphraseLabel" hidden>
+            Key Passphrase
+            <input id="sshPassphrase" name="sshPassphrase" type="password" autocomplete="current-password" placeholder="${isEditing ? 'Leave blank to keep saved passphrase' : ''}">
+          </label>
+        </div>
+      </fieldset>
       <label>
         Default Database
-        <input id="database" name="database" autocomplete="off">
+        <input id="database" name="database" value="${escapeHtml(connection?.database || '')}" autocomplete="off">
       </label>
       <label>
         Connection Name
-        <input id="name" name="name" value="root@127.0.0.1" required autocomplete="off">
+        <input id="name" name="name" value="${escapeHtml(connection?.name || 'root@127.0.0.1')}" required autocomplete="off">
       </label>
       <div class="actions">
-        <button id="save" type="submit">Save Connection</button>
-        <button id="test" class="secondary" type="button">Test Connection</button>
+        <button id="save" type="submit">${escapeHtml(saveLabel)}</button>
+        <button id="test" class="secondary" type="button">${escapeHtml(testLabel)}</button>
       </div>
       <div id="status" class="status" role="status" aria-live="polite"></div>
     </form>
@@ -3767,6 +4224,22 @@ function renderConnectionFormHtml() {
     const userInput = document.getElementById('user');
     const databaseInput = document.getElementById('database');
     const nameInput = document.getElementById('name');
+    const sshEnabledInput = document.getElementById('sshEnabled');
+    const sshFields = document.getElementById('sshFields');
+    const sshHostInput = document.getElementById('sshHost');
+    const sshPortInput = document.getElementById('sshPort');
+    const sshUserInput = document.getElementById('sshUser');
+    const sshAuthMethodInput = document.getElementById('sshAuthMethod');
+    const sshPasswordInput = document.getElementById('sshPassword');
+    const sshPrivateKeyPathInput = document.getElementById('sshPrivateKeyPath');
+    const sshPassphraseInput = document.getElementById('sshPassphrase');
+    const sshPasswordLabel = document.getElementById('sshPasswordLabel');
+    const sshPrivateKeyPathLabel = document.getElementById('sshPrivateKeyPathLabel');
+    const sshPassphraseLabel = document.getElementById('sshPassphraseLabel');
+    const pickSshKeyButton = document.getElementById('pickSshKey');
+    if (${isEditing ? 'true' : 'false'}) {
+      nameInput.dataset.touched = 'true';
+    }
 
     function value(id) {
       return document.getElementById(id).value;
@@ -3778,6 +4251,15 @@ function renderConnectionFormHtml() {
         port: value('port'),
         user: value('user'),
         password: value('password'),
+        color: document.querySelector('input[name="color"]:checked')?.value || 'default',
+        sshEnabled: sshEnabledInput.checked,
+        sshHost: value('sshHost'),
+        sshPort: value('sshPort'),
+        sshUser: value('sshUser'),
+        sshAuthMethod: value('sshAuthMethod'),
+        sshPassword: value('sshPassword'),
+        sshPrivateKeyPath: value('sshPrivateKeyPath'),
+        sshPassphrase: value('sshPassphrase'),
         database: value('database'),
         name: value('name')
       };
@@ -3807,12 +4289,34 @@ function renderConnectionFormHtml() {
       status.textContent = message || '';
     }
 
+    function setRequired(input, isRequired) {
+      input.required = isRequired;
+      input.disabled = !isRequired && input.id !== 'sshPassphrase';
+    }
+
+    function syncSshFields() {
+      const enabled = sshEnabledInput.checked;
+      const usesPrivateKey = sshAuthMethodInput.value === 'privateKey';
+      sshFields.hidden = !enabled;
+      sshPasswordLabel.hidden = !enabled || usesPrivateKey;
+      sshPrivateKeyPathLabel.hidden = !enabled || !usesPrivateKey;
+      sshPassphraseLabel.hidden = !enabled || !usesPrivateKey;
+      setRequired(sshHostInput, enabled);
+      setRequired(sshPortInput, enabled);
+      setRequired(sshUserInput, enabled);
+      setRequired(sshPasswordInput, enabled && !usesPrivateKey);
+      setRequired(sshPrivateKeyPathInput, enabled && usesPrivateKey);
+      sshPassphraseInput.disabled = !enabled || !usesPrivateKey;
+      sshAuthMethodInput.disabled = !enabled;
+      pickSshKeyButton.disabled = !enabled || !usesPrivateKey;
+    }
+
     function post(command) {
       if (!form.reportValidity()) {
         return;
       }
       setBusy(true);
-      setStatus('busy', command === 'test' ? 'Testing connection...' : 'Saving connection...');
+      setStatus('busy', command === 'test' ? 'Testing connection...' : '${isEditing ? 'Updating connection...' : 'Saving connection...'}');
       vscode.postMessage({
         command,
         values: collect()
@@ -3825,6 +4329,14 @@ function renderConnectionFormHtml() {
     nameInput.addEventListener('input', () => {
       nameInput.dataset.touched = 'true';
     });
+    sshEnabledInput.addEventListener('change', syncSshFields);
+    sshAuthMethodInput.addEventListener('change', syncSshFields);
+    pickSshKeyButton.addEventListener('click', () => {
+      vscode.postMessage({
+        command: 'pickSshKey',
+        currentPath: value('sshPrivateKeyPath')
+      });
+    });
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       post('save');
@@ -3833,11 +4345,15 @@ function renderConnectionFormHtml() {
     window.addEventListener('message', (event) => {
       const message = event.data || {};
       if (message.type !== 'status') {
+        if (message.type === 'sshKeyPicked' && message.path) {
+          sshPrivateKeyPathInput.value = message.path;
+        }
         return;
       }
       setBusy(false);
       setStatus(message.state, message.message);
     });
+    syncSshFields();
   </script>
 </body>
 </html>`;
@@ -3846,6 +4362,7 @@ function renderConnectionFormHtml() {
 function renderResultHtml(result) {
   const nonce = crypto.randomBytes(16).toString('base64');
   const body = result.kind === 'object' ? renderObjectDetails(result) : renderQueryResults(result);
+  const accentColor = escapeHtml(connectionAccentColor(result.connection));
 
   return `<!doctype html>
 <html lang="en">
@@ -3860,6 +4377,7 @@ function renderResultHtml(result) {
       --muted: var(--vscode-descriptionForeground);
       --bg-soft: var(--vscode-editorWidget-background);
       --accent: var(--vscode-focusBorder);
+      --connection-color: ${accentColor};
     }
     body {
       margin: 0;
@@ -3871,6 +4389,7 @@ function renderResultHtml(result) {
     .shell {
       display: grid;
       gap: 14px;
+      border-top: 3px solid var(--connection-color);
       padding: 16px;
     }
     .header {
@@ -3878,7 +4397,9 @@ function renderResultHtml(result) {
       align-items: flex-start;
       justify-content: space-between;
       gap: 16px;
+      border-left: 4px solid var(--connection-color);
       border-bottom: 1px solid var(--border);
+      padding-left: 12px;
       padding-bottom: 12px;
     }
     .title {
@@ -4111,7 +4632,36 @@ function formatCell(value) {
 
 function describeConnection(connection) {
   const base = `${connection.user}@${connection.host}:${connection.port}`;
-  return connection.database ? `${base}/${connection.database}` : base;
+  const database = connection.database ? `/${connection.database}` : '';
+  const ssh = connection.ssh?.enabled ? ` via SSH ${connection.ssh.user}@${connection.ssh.host}:${connection.ssh.port}` : '';
+  return `${base}${database}${ssh}`;
+}
+
+function normalizeConnectionColorId(value) {
+  const id = String(value || 'default');
+  return CONNECTION_COLOR_IDS.has(id) ? id : 'default';
+}
+
+function connectionColorOption(connection) {
+  const id = normalizeConnectionColorId(connection?.color);
+  return CONNECTION_COLORS.find((color) => color.id === id) || CONNECTION_COLORS[0];
+}
+
+function connectionThemeIcon(icon, connection) {
+  const color = connectionColorOption(connection);
+  return color.themeColor
+    ? new vscode.ThemeIcon(icon, new vscode.ThemeColor(color.themeColor))
+    : new vscode.ThemeIcon(icon);
+}
+
+function connectionAccentColor(connection) {
+  return connectionColorOption(connection).hex;
+}
+
+function connectionPanelIconPath(extensionUri, connection) {
+  const color = connectionColorOption(connection);
+  const iconName = color.id === 'default' ? 'icon.svg' : `connection-${color.id}.svg`;
+  return vscode.Uri.joinPath(extensionUri, 'resources', iconName);
 }
 
 function connectionStatusLabel(consoleContext) {
@@ -4131,6 +4681,28 @@ function describeQueryTarget(result) {
 
 function secretKey(id) {
   return `${MYSQL_PASSWORD_PREFIX}${id}`;
+}
+
+function sshPasswordSecretKey(id) {
+  return `${SSH_PASSWORD_PREFIX}${id}`;
+}
+
+function sshPassphraseSecretKey(id) {
+  return `${SSH_PASSPHRASE_PREFIX}${id}`;
+}
+
+function normalizeCredentialValue(value) {
+  return value === undefined ? undefined : String(value);
+}
+
+function expandHomePath(filePath) {
+  if (!filePath || filePath === '~') {
+    return filePath;
+  }
+  if (filePath.startsWith(`~${path.sep}`) || filePath.startsWith('~/')) {
+    return path.join(os.homedir(), filePath.slice(2));
+  }
+  return filePath;
 }
 
 function errorMessage(error) {
