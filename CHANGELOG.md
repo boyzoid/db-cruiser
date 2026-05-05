@@ -1,5 +1,11 @@
 # Change Log
 
+## 0.4.0
+
+- Added EXPLAIN support from SQL editors and the SQL console, including a visual execution-plan flow and raw plan details.
+- Improved tree-style EXPLAIN output so long plan text is split into readable wrapped steps, nested loops are indented, and the visual plan renders tree operations as a flowchart.
+- Added EXPLAIN bottleneck cues for full scans, temporary tables, sorts/filesorts, missing index choices, and high row estimates.
+
 ## 0.3.0
 
 - Upgraded table data views with pagination, adjustable page sizes, sorting, global search, per-column filters, and copy actions for cells, rows, and current-page column values.

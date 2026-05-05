@@ -78,6 +78,7 @@ function activate(context) {
       updateStatus();
     }),
     vscode.commands.registerCommand('dbCruiser.runQuery', () => runQuery(store, consoleSessions, mysql, resultView, provider)),
+    vscode.commands.registerCommand('dbCruiser.explainQuery', () => explainQuery(store, consoleSessions, mysql, resultView)),
     vscode.commands.registerCommand('dbCruiser.selectSchema', async () => {
       await selectSchemaForActiveConsole(store, consoleSessions, mysql);
       updateStatus();
@@ -957,6 +958,34 @@ class MySqlAdapter {
     }
   }
 
+  async explain(connection, sql, schema) {
+    const statement = prepareExplainStatement(sql);
+    const client = await this.connect(connection, undefined, { database: schema || connection.database });
+    try {
+      try {
+        const [treeRows] = await client.query(`explain format=tree ${statement}`);
+        if (explainTreeTextFromRows(treeRows)) {
+          return {
+            statement,
+            rows: Array.isArray(treeRows) ? treeRows.map((row) => ({ ...row })) : [],
+            format: 'tree'
+          };
+        }
+      } catch {
+        // Fall back for MySQL-compatible servers that do not support FORMAT=TREE.
+      }
+
+      const [rows] = await client.query(`explain ${statement}`);
+      return {
+        statement,
+        rows: Array.isArray(rows) ? rows.map((row) => ({ ...row })) : [],
+        format: explainTreeTextFromRows(rows) ? 'tree' : 'table'
+      };
+    } finally {
+      await client.end();
+    }
+  }
+
   async tableData(connection, schema, tableName, columns, state) {
     const client = await this.connect(connection, undefined, { database: schema || connection.database });
     const query = buildTableDataQuery(schema, tableName, columns, state);
@@ -1227,7 +1256,7 @@ class SqlConsoleView {
     });
 
     panel.webview.onDidReceiveMessage(async (message) => {
-      if (!message || !['run', 'schemaChanged', 'rowLimitChanged', 'sqlChanged', 'completion', 'exportResultSet'].includes(message.command)) {
+      if (!message || !['run', 'explain', 'schemaChanged', 'rowLimitChanged', 'sqlChanged', 'completion', 'exportResultSet'].includes(message.command)) {
         return;
       }
 
@@ -1278,6 +1307,11 @@ class SqlConsoleView {
           state: 'error',
           message: 'There is no SQL to run.'
         });
+        return;
+      }
+
+      if (message.command === 'explain') {
+        await this.explain(panel, connection, nextSchema, sql);
         return;
       }
 
@@ -1344,6 +1378,41 @@ class SqlConsoleView {
         state: 'success',
         message: `Completed in ${elapsedMs} ms.`,
         html: renderQueryResults(result)
+      });
+    } catch (error) {
+      await panel.webview.postMessage({
+        type: 'status',
+        state: 'error',
+        message: errorMessage(error)
+      });
+    }
+  }
+
+  async explain(panel, connection, schema, sql) {
+    await panel.webview.postMessage({
+      type: 'status',
+      state: 'busy',
+      message: `Explaining on ${schema || connection.database || connection.name}...`
+    });
+
+    try {
+      const started = Date.now();
+      const plan = await this.mysql.explain(connection, sql, schema || connection.database);
+      const elapsedMs = Date.now() - started;
+      const result = {
+        kind: 'explain',
+        connection,
+        schema: schema || connection.database,
+        sql: plan.statement,
+        elapsedMs,
+        planRows: plan.rows,
+        planFormat: plan.format
+      };
+      await panel.webview.postMessage({
+        type: 'results',
+        state: 'success',
+        message: `Explained in ${elapsedMs} ms.`,
+        html: renderExplainResults(result)
       });
     } catch (error) {
       await panel.webview.postMessage({
@@ -1766,6 +1835,51 @@ async function runQuery(store, consoleSessions, mysql, resultView, provider) {
           resultSets
         });
         provider.refresh();
+      } catch (error) {
+        vscode.window.showErrorMessage(errorMessage(error));
+      }
+    }
+  );
+}
+
+async function explainQuery(store, consoleSessions, mysql, resultView) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.languageId !== 'sql') {
+    vscode.window.showInformationMessage('Open a SQL editor before explaining a query.');
+    return;
+  }
+
+  const consoleContext = getConsoleContextForDocument(editor.document, store, consoleSessions);
+  const connection = consoleContext?.connection || await pickConnection(store);
+  if (!connection) {
+    return;
+  }
+  const schema = consoleContext?.schema || connection.database;
+  const sql = getSelectedOrFullText(editor);
+  if (!hasRunnableSql(sql)) {
+    vscode.window.showInformationMessage('There is no SQL to explain.');
+    return;
+  }
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Explaining query on ${connection.name}`,
+      cancellable: false
+    },
+    async () => {
+      try {
+        const started = Date.now();
+        const plan = await mysql.explain(connection, sql, schema);
+        resultView.show(`${connection.name} Explain`, {
+          kind: 'explain',
+          connection,
+          schema,
+          sql: plan.statement,
+          elapsedMs: Date.now() - started,
+          planRows: plan.rows,
+          planFormat: plan.format
+        });
       } catch (error) {
         vscode.window.showErrorMessage(errorMessage(error));
       }
@@ -2221,6 +2335,56 @@ function hasRunnableSql(sql) {
     .replace(/--[^\r\n]*/g, '')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .trim().length > 0;
+}
+
+function prepareExplainStatement(sql) {
+  const source = String(sql || '').trim();
+  if (!hasRunnableSql(source)) {
+    throw new Error('There is no SQL to explain.');
+  }
+
+  const semicolonIndex = firstSqlStatementTerminatorIndex(source);
+  const statement = semicolonIndex >= 0
+    ? source.slice(0, semicolonIndex)
+    : source.replace(/;\s*$/, '');
+  if (semicolonIndex >= 0 && hasRunnableSql(source.slice(semicolonIndex + 1))) {
+    throw new Error('Explain supports one SQL statement at a time.');
+  }
+
+  const explainable = stripLeadingSqlComments(statement).trim();
+  if (!/^(select|with|insert|update|delete|replace)\b/i.test(explainable)) {
+    throw new Error('EXPLAIN is available for SELECT, WITH, INSERT, UPDATE, DELETE, and REPLACE statements.');
+  }
+
+  return explainable;
+}
+
+function firstSqlStatementTerminatorIndex(sql) {
+  return maskSqlLiteralsAndComments(sql).indexOf(';');
+}
+
+function stripLeadingSqlComments(sql) {
+  let text = String(sql || '').trimStart();
+  while (text) {
+    if (text.startsWith('--') || text.startsWith('#')) {
+      const nextLine = text.indexOf('\n');
+      if (nextLine === -1) {
+        return '';
+      }
+      text = text.slice(nextLine + 1).trimStart();
+      continue;
+    }
+    if (text.startsWith('/*')) {
+      const commentEnd = text.indexOf('*/');
+      if (commentEnd === -1) {
+        return '';
+      }
+      text = text.slice(commentEnd + 2).trimStart();
+      continue;
+    }
+    break;
+  }
+  return text;
 }
 
 function appendLimitHint(sql, maxRows) {
@@ -3649,6 +3813,286 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       color: var(--muted);
       padding: 16px;
     }
+    .plan-flow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: stretch;
+      padding: 12px;
+      background: var(--vscode-editor-background);
+    }
+    .plan-step {
+      min-width: 190px;
+      max-width: 340px;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--connection-color);
+      border-radius: 6px;
+      padding: 9px;
+      background: var(--bg-soft);
+    }
+    .plan-arrow {
+      align-self: center;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .plan-index,
+    .plan-meta,
+    .plan-metric-label {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .plan-object {
+      margin-top: 2px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    .plan-metrics {
+      display: grid;
+      gap: 5px;
+      margin-top: 8px;
+    }
+    .plan-metric {
+      display: grid;
+      grid-template-columns: 62px minmax(0, 1fr);
+      gap: 6px;
+    }
+    .plan-metric-value {
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+      white-space: normal;
+    }
+    .plan-detail-table {
+      table-layout: auto;
+      min-width: 100%;
+    }
+    .plan-detail-table td {
+      max-width: 360px;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .plan-detail-table .compact-cell {
+      max-width: 170px;
+    }
+    .explain-detail-line {
+      display: block;
+    }
+    .explain-tree {
+      display: grid;
+      gap: 6px;
+      padding: 12px;
+      background: var(--vscode-editor-background);
+    }
+    .explain-tree-line {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 8px;
+      border-left: 3px solid var(--connection-color);
+      padding: 7px 9px;
+      background: var(--bg-soft);
+      line-height: 1.4;
+    }
+    .explain-tree-body {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+    }
+    .explain-tree-marker {
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .explain-tree-text {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .explain-visual-flow {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      background: var(--vscode-editor-background);
+    }
+    .explain-visual-step {
+      display: grid;
+      gap: 6px;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--connection-color);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--bg-soft);
+    }
+    .explain-visual-title {
+      overflow-wrap: anywhere;
+      font-weight: 600;
+    }
+    .explain-visual-detail {
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }
+    .explain-visual-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .explain-visual-chip {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 6px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .explain-flowchart {
+      overflow: auto;
+      padding: 18px;
+      background: var(--vscode-editor-background);
+    }
+    .explain-flow-roots {
+      display: flex;
+      flex-direction: column;
+      gap: 30px;
+      align-items: center;
+      min-width: max-content;
+    }
+    .explain-flow-node {
+      display: flex;
+      position: relative;
+      flex-direction: column;
+      align-items: center;
+    }
+    .explain-flow-card {
+      position: relative;
+      box-sizing: border-box;
+      width: 260px;
+      border: 1px solid var(--border);
+      border-top: 4px solid var(--connection-color);
+      border-radius: 7px;
+      padding: 10px;
+      background: var(--bg-soft);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+    }
+    .explain-flow-node.has-children > .explain-flow-card::after {
+      content: '';
+      position: absolute;
+      bottom: -22px;
+      left: 50%;
+      height: 22px;
+      border-left: 2px solid var(--border);
+    }
+    .explain-flow-children {
+      display: flex;
+      position: relative;
+      gap: 28px;
+      justify-content: center;
+      padding-top: 28px;
+    }
+    .explain-flow-children.multiple::before {
+      content: '';
+      position: absolute;
+      top: 14px;
+      left: 130px;
+      right: 130px;
+      border-top: 2px solid var(--border);
+    }
+    .explain-flow-child {
+      position: relative;
+    }
+    .explain-flow-child::before {
+      content: '';
+      position: absolute;
+      top: -14px;
+      left: 50%;
+      height: 14px;
+      border-left: 2px solid var(--border);
+    }
+    .explain-flow-title {
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+      font-weight: 700;
+    }
+    .explain-flow-detail {
+      margin-top: 4px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .explain-flow-node-lookup .explain-flow-card {
+      border-top-color: var(--vscode-charts-green, #89d185);
+    }
+    .explain-flow-node-sort .explain-flow-card,
+    .explain-flow-node-filter .explain-flow-card {
+      border-top-color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-flow-node-temp .explain-flow-card {
+      border-top-color: var(--vscode-charts-orange, #d18616);
+    }
+    .explain-flow-node-join .explain-flow-card {
+      border-top-color: var(--vscode-charts-blue, #3794ff);
+    }
+    .explain-risk-warning.explain-flow-card,
+    .explain-risk-warning .explain-flow-card {
+      border-left-width: 4px;
+      border-left-color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-risk-critical.explain-flow-card,
+    .explain-risk-critical .explain-flow-card {
+      border-left-width: 4px;
+      border-left-color: var(--vscode-charts-red, #f14c4c);
+    }
+    .explain-flow-card .explain-risk-badges,
+    .explain-flow-card .explain-visual-chips {
+      margin-top: 8px;
+    }
+    .explain-risk-warning {
+      border-left-color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-risk-critical {
+      border-left-color: var(--vscode-charts-red, #f14c4c);
+    }
+    .explain-risk-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .explain-risk-badge {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .explain-risk-badge.warning {
+      color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-risk-badge.critical {
+      color: var(--vscode-charts-red, #f14c4c);
+    }
+    .explain-depth-1 {
+      margin-left: 18px;
+    }
+    .explain-depth-2 {
+      margin-left: 36px;
+    }
+    .explain-depth-3 {
+      margin-left: 54px;
+    }
+    .explain-depth-4 {
+      margin-left: 72px;
+    }
+    .explain-depth-5 {
+      margin-left: 90px;
+    }
+    .explain-depth-6 {
+      margin-left: 108px;
+    }
+    .explain-depth-7 {
+      margin-left: 126px;
+    }
+    .explain-depth-8 {
+      margin-left: 144px;
+    }
     @media (max-width: 720px) {
       .toolbar {
         align-items: stretch;
@@ -3681,6 +4125,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
         </select>
       </label>
       <button id="run" type="button">Run</button>
+      <button id="explain" class="secondary" type="button">Explain</button>
       <button id="clear" class="secondary" type="button">Clear</button>
     </section>
     <div class="editor-wrap">
@@ -3698,6 +4143,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     const sql = document.getElementById('sql');
     const sqlHighlight = document.getElementById('sql-highlight');
     const run = document.getElementById('run');
+    const explain = document.getElementById('explain');
     const clear = document.getElementById('clear');
     const status = document.getElementById('status');
     const results = document.getElementById('results');
@@ -3714,6 +4160,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
 
     function setBusy(isBusy) {
       run.disabled = isBusy;
+      explain.disabled = isBusy;
       clear.disabled = isBusy;
       schema.disabled = isBusy;
       rowLimit.disabled = isBusy;
@@ -3733,7 +4180,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     }
 
     const SQL_INDENT = '  ';
-    const SQL_HIGHLIGHT_KEYWORDS = new Set('add all alter and as asc between by case create cross delete desc distinct drop else end exists from full group having in inner insert into is join left like limit not null on or order outer right select set then union update values when where with table view primary key foreign references index unique constraint database schema if begin commit rollback transaction'.split(' '));
+    const SQL_HIGHLIGHT_KEYWORDS = new Set('add all alter and as asc between by case create cross delete desc distinct drop else end exists explain from full group having in inner insert into is join left like limit not null on or order outer right select set then union update values when where with table view primary key foreign references index unique constraint database schema if begin commit rollback transaction'.split(' '));
     const SQL_HIGHLIGHT_FUNCTIONS = new Set('avg coalesce concat count curdate date_format ifnull lower max min now nullif round sum upper'.split(' '));
 
     function handleSqlChanged(options = {}) {
@@ -4315,6 +4762,12 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       post('run');
     }
 
+    function explainQuery() {
+      setBusy(true);
+      setStatus('busy', 'Explaining...');
+      post('explain');
+    }
+
     const restored = vscode.getState();
     if (restored) {
       if (typeof restored.sql === 'string') {
@@ -4330,6 +4783,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     updateHighlight();
 
     run.addEventListener('click', execute);
+    explain.addEventListener('click', explainQuery);
     clear.addEventListener('click', () => {
       sql.value = '';
       results.innerHTML = '';
@@ -5396,7 +5850,11 @@ function formatDataViewRange(state, rowCount, total) {
 
 function renderResultHtml(result) {
   const nonce = crypto.randomBytes(16).toString('base64');
-  const body = result.kind === 'object' ? renderObjectDetails(result) : renderQueryResults(result);
+  const body = result.kind === 'object'
+    ? renderObjectDetails(result)
+    : result.kind === 'explain'
+      ? renderExplainResults(result)
+      : renderQueryResults(result);
   const accentColor = escapeHtml(connectionAccentColor(result.connection));
 
   return `<!doctype html>
@@ -5528,6 +5986,286 @@ function renderResultHtml(result) {
       color: var(--muted);
       padding: 16px;
     }
+    .plan-flow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: stretch;
+      padding: 12px;
+      background: var(--vscode-editor-background);
+    }
+    .plan-step {
+      min-width: 190px;
+      max-width: 340px;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--connection-color);
+      border-radius: 6px;
+      padding: 9px;
+      background: var(--bg-soft);
+    }
+    .plan-arrow {
+      align-self: center;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .plan-index,
+    .plan-meta,
+    .plan-metric-label {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .plan-object {
+      margin-top: 2px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    .plan-metrics {
+      display: grid;
+      gap: 5px;
+      margin-top: 8px;
+    }
+    .plan-metric {
+      display: grid;
+      grid-template-columns: 62px minmax(0, 1fr);
+      gap: 6px;
+    }
+    .plan-metric-value {
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+      white-space: normal;
+    }
+    .plan-detail-table {
+      table-layout: auto;
+      min-width: 100%;
+    }
+    .plan-detail-table td {
+      max-width: 360px;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .plan-detail-table .compact-cell {
+      max-width: 170px;
+    }
+    .explain-detail-line {
+      display: block;
+    }
+    .explain-tree {
+      display: grid;
+      gap: 6px;
+      padding: 12px;
+      background: var(--vscode-editor-background);
+    }
+    .explain-tree-line {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 8px;
+      border-left: 3px solid var(--connection-color);
+      padding: 7px 9px;
+      background: var(--bg-soft);
+      line-height: 1.4;
+    }
+    .explain-tree-body {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+    }
+    .explain-tree-marker {
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .explain-tree-text {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .explain-visual-flow {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      background: var(--vscode-editor-background);
+    }
+    .explain-visual-step {
+      display: grid;
+      gap: 6px;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--connection-color);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--bg-soft);
+    }
+    .explain-visual-title {
+      overflow-wrap: anywhere;
+      font-weight: 600;
+    }
+    .explain-visual-detail {
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }
+    .explain-visual-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .explain-visual-chip {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 6px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .explain-flowchart {
+      overflow: auto;
+      padding: 18px;
+      background: var(--vscode-editor-background);
+    }
+    .explain-flow-roots {
+      display: flex;
+      flex-direction: column;
+      gap: 30px;
+      align-items: center;
+      min-width: max-content;
+    }
+    .explain-flow-node {
+      display: flex;
+      position: relative;
+      flex-direction: column;
+      align-items: center;
+    }
+    .explain-flow-card {
+      position: relative;
+      box-sizing: border-box;
+      width: 260px;
+      border: 1px solid var(--border);
+      border-top: 4px solid var(--connection-color);
+      border-radius: 7px;
+      padding: 10px;
+      background: var(--bg-soft);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+    }
+    .explain-flow-node.has-children > .explain-flow-card::after {
+      content: '';
+      position: absolute;
+      bottom: -22px;
+      left: 50%;
+      height: 22px;
+      border-left: 2px solid var(--border);
+    }
+    .explain-flow-children {
+      display: flex;
+      position: relative;
+      gap: 28px;
+      justify-content: center;
+      padding-top: 28px;
+    }
+    .explain-flow-children.multiple::before {
+      content: '';
+      position: absolute;
+      top: 14px;
+      left: 130px;
+      right: 130px;
+      border-top: 2px solid var(--border);
+    }
+    .explain-flow-child {
+      position: relative;
+    }
+    .explain-flow-child::before {
+      content: '';
+      position: absolute;
+      top: -14px;
+      left: 50%;
+      height: 14px;
+      border-left: 2px solid var(--border);
+    }
+    .explain-flow-title {
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+      font-weight: 700;
+    }
+    .explain-flow-detail {
+      margin-top: 4px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .explain-flow-node-lookup .explain-flow-card {
+      border-top-color: var(--vscode-charts-green, #89d185);
+    }
+    .explain-flow-node-sort .explain-flow-card,
+    .explain-flow-node-filter .explain-flow-card {
+      border-top-color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-flow-node-temp .explain-flow-card {
+      border-top-color: var(--vscode-charts-orange, #d18616);
+    }
+    .explain-flow-node-join .explain-flow-card {
+      border-top-color: var(--vscode-charts-blue, #3794ff);
+    }
+    .explain-risk-warning.explain-flow-card,
+    .explain-risk-warning .explain-flow-card {
+      border-left-width: 4px;
+      border-left-color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-risk-critical.explain-flow-card,
+    .explain-risk-critical .explain-flow-card {
+      border-left-width: 4px;
+      border-left-color: var(--vscode-charts-red, #f14c4c);
+    }
+    .explain-flow-card .explain-risk-badges,
+    .explain-flow-card .explain-visual-chips {
+      margin-top: 8px;
+    }
+    .explain-risk-warning {
+      border-left-color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-risk-critical {
+      border-left-color: var(--vscode-charts-red, #f14c4c);
+    }
+    .explain-risk-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .explain-risk-badge {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .explain-risk-badge.warning {
+      color: var(--vscode-charts-yellow, #cca700);
+    }
+    .explain-risk-badge.critical {
+      color: var(--vscode-charts-red, #f14c4c);
+    }
+    .explain-depth-1 {
+      margin-left: 18px;
+    }
+    .explain-depth-2 {
+      margin-left: 36px;
+    }
+    .explain-depth-3 {
+      margin-left: 54px;
+    }
+    .explain-depth-4 {
+      margin-left: 72px;
+    }
+    .explain-depth-5 {
+      margin-left: 90px;
+    }
+    .explain-depth-6 {
+      margin-left: 108px;
+    }
+    .explain-depth-7 {
+      margin-left: 126px;
+    }
+    .explain-depth-8 {
+      margin-left: 144px;
+    }
   </style>
 </head>
 <body>
@@ -5553,6 +6291,336 @@ function renderResultHtml(result) {
 </html>`;
 }
 
+function renderExplainResults(result) {
+  const planRows = result.planRows || [];
+  const treeText = explainTreeTextFromRows(planRows);
+  return `<header class="header">
+    <div>
+      <h1 class="title">${escapeHtml(result.connection.name)} Explain</h1>
+      <div class="meta">${escapeHtml(describeQueryTarget(result))}</div>
+    </div>
+    <span class="pill">${result.elapsedMs} ms</span>
+  </header>
+  <section class="block">
+    <div class="block-title">SQL</div>
+    <pre><code>${escapeHtml(result.sql)}</code></pre>
+  </section>
+  <section class="block">
+    <div class="block-title">Plan Details</div>
+    <div class="scroller">${treeText
+      ? renderExplainTreeText(treeText)
+      : planRows.length ? renderExplainDetailsTable(planRows) : '<div class="empty">No plan details returned.</div>'}</div>
+  </section>
+  <section class="block">
+    <div class="block-title">Visual Plan</div>
+    ${treeText
+      ? renderExplainTreeVisual(treeText)
+      : planRows.length ? renderExplainPlanFlow(planRows) : '<div class="empty">No plan rows returned.</div>'}
+  </section>`;
+}
+
+function renderExplainPlanFlow(planRows) {
+  return `<div class="plan-flow">${planRows.map((row, index) => (
+    `${renderExplainPlanStep(row, index)}${index === planRows.length - 1 ? '' : '<div class="plan-arrow">-&gt;</div>'}`
+  )).join('')}</div>`;
+}
+
+function renderExplainPlanStep(row, index) {
+  const table = explainRowValue(row, 'table') || explainRowValue(row, 'select_type') || `step ${index + 1}`;
+  const selectType = explainRowValue(row, 'select_type');
+  const accessType = explainRowValue(row, 'type');
+  const key = explainRowValue(row, 'key') || 'none';
+  const rows = explainRowValue(row, 'rows') || 'unknown';
+  const filtered = explainRowValue(row, 'filtered');
+  const extra = explainRowValue(row, 'Extra');
+  const risk = explainRiskForRow(row);
+
+  return `<article class="plan-step ${explainRiskClass(risk.severity)}">
+    <div class="plan-index">Step ${index + 1}</div>
+    <div class="plan-object" title="${escapeHtml(table)}">${escapeHtml(table)}</div>
+    <div class="plan-meta">${escapeHtml([selectType, accessType].filter(Boolean).join(' · ') || 'plan step')}</div>
+    ${renderExplainRiskBadges(risk)}
+    <div class="plan-metrics">
+      ${renderExplainMetric('key', key)}
+      ${renderExplainMetric('rows', rows)}
+      ${filtered !== undefined && filtered !== null ? renderExplainMetric('filter', `${filtered}%`) : ''}
+      ${extra ? renderExplainMetric('extra', extra) : ''}
+    </div>
+  </article>`;
+}
+
+function renderExplainMetric(label, value) {
+  return `<div class="plan-metric">
+    <span class="plan-metric-label">${escapeHtml(label)}</span>
+    <span class="plan-metric-value" title="${escapeHtml(value)}">${escapeHtml(value)}</span>
+  </div>`;
+}
+
+function explainRowValue(row, name) {
+  if (!row || typeof row !== 'object') {
+    return undefined;
+  }
+  if (Object.prototype.hasOwnProperty.call(row, name)) {
+    return row[name];
+  }
+  const lowerName = name.toLowerCase();
+  const key = Object.keys(row).find((candidate) => candidate.toLowerCase() === lowerName);
+  return key ? row[key] : undefined;
+}
+
+function explainTreeTextFromRows(rows) {
+  const planRows = Array.isArray(rows) ? rows : [];
+  if (!planRows.length) {
+    return '';
+  }
+
+  const columns = collectRowColumns(planRows);
+  const treeColumn = columns.find((column) => /^explain\b/i.test(column)) || (columns.length === 1 ? columns[0] : '');
+  if (!treeColumn) {
+    return '';
+  }
+
+  const text = planRows
+    .map((row) => row?.[treeColumn])
+    .filter((value) => value !== undefined && value !== null)
+    .map(String)
+    .join('\n')
+    .trim();
+  return text && (text.includes('->') || text.includes('\n')) ? text : '';
+}
+
+function renderExplainTreeVisual(value) {
+  const roots = explainTreeRoots(value);
+  if (!roots.length) {
+    return '<div class="empty">No plan rows returned.</div>';
+  }
+
+  return `<div class="explain-flowchart">
+    <div class="explain-flow-roots">${roots.map(renderExplainFlowNode).join('')}</div>
+  </div>`;
+}
+
+function renderExplainFlowNode(node) {
+  const summary = summarizeExplainTreeLine(node.text);
+  const risk = explainRiskForText(node.text);
+  const children = node.children || [];
+  const childClass = children.length > 1 ? 'multiple' : 'single';
+  return `<div class="explain-flow-node ${children.length ? 'has-children' : ''} ${explainFlowNodeTypeClass(node.text)} ${explainRiskClass(risk.severity)}">
+    <article class="explain-flow-card">
+      <div class="plan-index">Step ${node.index + 1}</div>
+      <div class="explain-flow-title" title="${escapeHtml(summary.title)}">${escapeHtml(summary.title)}</div>
+    ${summary.detail ? `<div class="explain-flow-detail">${escapeHtml(summary.detail)}</div>` : ''}
+    ${renderExplainRiskBadges(risk)}
+    ${summary.chips.length ? `<div class="explain-visual-chips">${summary.chips.map((chip) => (
+      `<span class="explain-visual-chip">${escapeHtml(chip)}</span>`
+    )).join('')}</div>` : ''}
+    </article>
+    ${children.length ? `<div class="explain-flow-children ${childClass}">${children.map((child) => (
+      `<div class="explain-flow-child">${renderExplainFlowNode(child)}</div>`
+    )).join('')}</div>` : ''}
+  </div>`;
+}
+
+function explainTreeRoots(value) {
+  const steps = explainTreeSteps(value).map((step, index) => ({
+    ...step,
+    index,
+    children: []
+  }));
+  const roots = [];
+  const stack = [];
+
+  steps.forEach((node) => {
+    while (stack.length && stack[stack.length - 1].depth >= node.depth) {
+      stack.pop();
+    }
+
+    const parent = stack[stack.length - 1];
+    if (parent) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+    stack.push(node);
+  });
+
+  return roots;
+}
+
+function explainFlowNodeTypeClass(text) {
+  const value = String(text || '').toLowerCase();
+  if (value.includes('index lookup')) {
+    return 'explain-flow-node-lookup';
+  }
+  if (value.includes('temporary')) {
+    return 'explain-flow-node-temp';
+  }
+  if (value.includes('nested loop') || value.includes('join')) {
+    return 'explain-flow-node-join';
+  }
+  if (value.includes('sort')) {
+    return 'explain-flow-node-sort';
+  }
+  if (value.includes('filter')) {
+    return 'explain-flow-node-filter';
+  }
+  return '';
+}
+
+function summarizeExplainTreeLine(line) {
+  const text = String(line || '').trim();
+  const chips = [];
+  const metrics = text.match(/\((?:cost|actual)[^)]+\)/gi) || [];
+  metrics.forEach((metric) => chips.push(metric.slice(1, -1)));
+  const title = text
+    .replace(/\((?:cost|actual)[^)]+\)/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim() || text;
+  const detail = metrics.length ? text.replace(title, '').trim() : '';
+  return {
+    title,
+    detail,
+    chips
+  };
+}
+
+function explainRiskForRow(row) {
+  const accessType = String(explainRowValue(row, 'type') || '').toUpperCase();
+  const key = explainRowValue(row, 'key');
+  const possibleKeys = explainRowValue(row, 'possible_keys');
+  const extra = String(explainRowValue(row, 'Extra') || '');
+  const rows = Number(explainRowValue(row, 'rows'));
+  const badges = [];
+  let severity = '';
+
+  if (accessType === 'ALL') {
+    badges.push({ label: 'full scan', severity: 'critical' });
+    severity = 'critical';
+  }
+  if (!key && possibleKeys && String(possibleKeys).toUpperCase() !== 'NULL') {
+    badges.push({ label: 'index not chosen', severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+  if (/\busing temporary\b/i.test(extra)) {
+    badges.push({ label: 'temporary table', severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+  if (/\busing filesort\b/i.test(extra)) {
+    badges.push({ label: 'filesort', severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+  if (Number.isFinite(rows) && rows >= 10000) {
+    badges.push({ label: `many rows ${rows}`, severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+
+  return { severity, badges };
+}
+
+function explainRiskForText(line) {
+  const text = String(line || '');
+  const rows = explainRowsEstimate(text);
+  const badges = [];
+  let severity = '';
+
+  if (/\btable scan\b/i.test(text) && !/<temporary>/i.test(text)) {
+    badges.push({ label: 'full scan', severity: 'critical' });
+    severity = 'critical';
+  }
+  if (/\btable scan on <temporary>/i.test(text)) {
+    badges.push({ label: 'temp scan', severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+  if (/\btemporary table\b/i.test(text)) {
+    badges.push({ label: 'temporary table', severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+  if (/\bfilesort\b|\bsort:/i.test(text)) {
+    badges.push({ label: 'sort', severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+  if (/\bindex lookup\b/i.test(text) && /\busing\b/i.test(text) && /\bkey=none\b/i.test(text)) {
+    badges.push({ label: 'no index', severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+  if (Number.isFinite(rows) && rows >= 10000) {
+    badges.push({ label: `many rows ${rows}`, severity: 'warning' });
+    severity = maxExplainSeverity(severity, 'warning');
+  }
+
+  return { severity, badges };
+}
+
+function explainRowsEstimate(text) {
+  const matches = [...String(text || '').matchAll(/\brows=([0-9]+(?:\.[0-9]+)?)/gi)];
+  if (!matches.length) {
+    return NaN;
+  }
+  return Math.max(...matches.map((match) => Number(match[1])).filter(Number.isFinite));
+}
+
+function maxExplainSeverity(left, right) {
+  const rank = { '': 0, warning: 1, critical: 2 };
+  return rank[right] > rank[left] ? right : left;
+}
+
+function explainRiskClass(severity) {
+  return severity ? `explain-risk-${severity}` : '';
+}
+
+function renderExplainRiskBadges(risk) {
+  const badges = risk?.badges || [];
+  if (!badges.length) {
+    return '';
+  }
+
+  return `<div class="explain-risk-badges">${badges.map((badge) => (
+    `<span class="explain-risk-badge ${escapeHtml(badge.severity)}">${escapeHtml(badge.label)}</span>`
+  )).join('')}</div>`;
+}
+
+function renderExplainDetailsTable(rows) {
+  const columns = explainDetailColumns(rows);
+  const head = columns.map((column) => `<th>${escapeHtml(column)}</th>`).join('');
+  const body = rows.map((row) => {
+    const cells = columns.map((column) => {
+      const value = explainRowValue(row, column);
+      const cellClass = isCompactExplainColumn(column) ? ' class="compact-cell"' : '';
+      return `<td${cellClass}>${formatExplainDetailCell(value)}</td>`;
+    }).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+
+  return `<table class="plan-detail-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function explainDetailColumns(rows) {
+  const preferred = ['id', 'select_type', 'table', 'partitions', 'type', 'possible_keys', 'key', 'key_len', 'ref', 'rows', 'filtered', 'Extra'];
+  const available = new Set();
+  rows.forEach((row) => Object.keys(row || {}).forEach((key) => available.add(key)));
+  const ordered = preferred.filter((column) => Array.from(available).some((key) => key.toLowerCase() === column.toLowerCase()));
+  const extras = Array.from(available).filter((key) => !ordered.some((column) => column.toLowerCase() === key.toLowerCase()));
+  return [...ordered, ...extras];
+}
+
+function isCompactExplainColumn(column) {
+  return ['id', 'select_type', 'table', 'type', 'key', 'key_len', 'rows', 'filtered'].includes(String(column || '').toLowerCase());
+}
+
+function formatExplainDetailCell(value) {
+  const text = formatCell(value);
+  if (!text.includes(';')) {
+    return escapeHtml(text);
+  }
+
+  return text
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => `<span class="explain-detail-line">${escapeHtml(part)}</span>`)
+    .join('');
+}
+
 function renderQueryResults(result) {
   const resultBlocks = result.resultSets.map((set, index) => {
     const title = set.label || `Result ${index + 1}`;
@@ -5560,6 +6628,16 @@ function renderQueryResults(result) {
       return `<section class="block">
         <div class="block-title">${escapeHtml(title)}</div>
         <div class="empty">${escapeHtml(set.message || 'No rows returned.')}</div>
+      </section>`;
+    }
+
+    if (isExplainTreeResultSet(set)) {
+      return `<section class="block">
+        <div class="block-title">
+          <span>${escapeHtml(explainTreeResultTitle(set))}</span>
+          ${renderExportActions(index)}
+        </div>
+        ${renderExplainTreeText(explainTreeResultText(set))}
       </section>`;
     }
 
@@ -5584,6 +6662,152 @@ function renderQueryResults(result) {
     <pre><code>${escapeHtml(result.sql)}</code></pre>
   </section>
   ${resultBlocks}`;
+}
+
+function isExplainTreeResultSet(set) {
+  const rows = set?.rows || [];
+  return Boolean(explainTreeTextFromRows(rows));
+}
+
+function explainTreeResultTitle(set) {
+  const column = collectRowColumns(set.rows || [])[0];
+  return column || 'EXPLAIN';
+}
+
+function explainTreeResultText(set) {
+  return explainTreeTextFromRows(set?.rows || []);
+}
+
+function renderExplainTreeText(value) {
+  const steps = explainTreeSteps(value);
+  if (!steps.length) {
+    return '<div class="empty">No EXPLAIN output returned.</div>';
+  }
+
+  return `<div class="explain-tree">${steps.map((step) => {
+    const risk = explainRiskForText(step.text);
+    return `<div class="explain-tree-line ${explainDepthClass(step.depth)} ${explainRiskClass(risk.severity)}">
+      <span class="explain-tree-marker">-&gt;</span>
+      <span class="explain-tree-body">
+        <span class="explain-tree-text">${escapeHtml(step.text)}</span>
+        ${renderExplainRiskBadges(risk)}
+      </span>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function explainDepthClass(depth) {
+  const value = Math.max(0, Math.min(8, Number(depth) || 0));
+  return value ? `explain-depth-${value}` : '';
+}
+
+function splitExplainTreeText(value) {
+  return explainTreeSteps(value).map((step) => step.text);
+}
+
+function explainTreeSteps(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return [];
+  }
+
+  const rawNaturalLines = text
+    .split(/\r?\n/)
+    .filter((line) => line.trim());
+  if (rawNaturalLines.length > 1) {
+    const lines = rawNaturalLines
+      .map((line) => {
+        const leading = explainLeadingSpaceCount(line);
+        return {
+          text: normalizeExplainTreeLine(line),
+          leading
+        };
+      })
+      .filter((step) => step.text);
+    const indentUnit = explainIndentUnit(lines.map((line) => line.leading));
+    return lines.map((line) => ({
+      text: line.text,
+      depth: Math.max(0, Math.floor(line.leading / indentUnit))
+    }));
+  }
+
+  return explainInlineTreeSteps(normalizeExplainTreeLine(text)
+    .split(/\s*->\s*/g)
+    .map((line) => line.trim())
+    .filter(Boolean));
+}
+
+function normalizeExplainTreeLine(line) {
+  return String(line || '')
+    .trim()
+    .replace(/^EXPLAIN:\s*/i, '')
+    .replace(/^->\s*/, '')
+    .trim();
+}
+
+function explainLeadingSpaceCount(line) {
+  const leading = String(line || '').match(/^\s*/)?.[0] || '';
+  return leading.replace(/\t/g, '    ').length;
+}
+
+function explainIndentUnit(indents) {
+  const positiveIndents = indents.filter((indent) => indent > 0);
+  if (!positiveIndents.length) {
+    return 1;
+  }
+  return positiveIndents.reduce(gcdNumber) || Math.min(...positiveIndents) || 1;
+}
+
+function gcdNumber(left, right) {
+  let a = Math.abs(Number(left) || 0);
+  let b = Math.abs(Number(right) || 0);
+  while (b) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+  return a || 1;
+}
+
+function explainInlineTreeSteps(lines) {
+  const stack = [];
+
+  return lines.map((line) => {
+    while (stack.length && stack[stack.length - 1].remaining <= 0) {
+      stack.pop();
+    }
+
+    const parent = stack[stack.length - 1];
+    const depth = parent ? parent.depth + 1 : 0;
+    if (parent) {
+      parent.remaining -= 1;
+    }
+
+    const childCapacity = explainTreeChildCapacity(line);
+    if (childCapacity > 0) {
+      stack.push({ depth, remaining: childCapacity });
+    }
+
+    while (stack.length && stack[stack.length - 1].remaining <= 0) {
+      stack.pop();
+    }
+
+    return {
+      text: line,
+      depth
+    };
+  });
+}
+
+function explainTreeChildCapacity(line) {
+  const text = String(line || '').toLowerCase();
+  if (/\bnested\s+loop\b|\bhash\s+join\b|\bmerge\s+join\b/.test(text)) {
+    return 2;
+  }
+  if (/\bsort:|\bfilter:|\blimit:|\baggregate\b|\bwindow\b|\bmaterialize\b|\btemporary table\b|\btable scan on <temporary>/.test(text)) {
+    return 1;
+  }
+  return 0;
 }
 
 function renderExportActions(resultSetIndex) {

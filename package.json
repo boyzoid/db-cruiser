@@ -2,7 +2,7 @@
   "name": "db-cruiser",
   "displayName": "DB Cruiser",
   "description": "A database explorer and SQL console for VS Code.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "stroz-dot-dev",
   "author": "The Stroz",
   "license": "MIT",
@@ -32,6 +32,7 @@
     "onCommand:dbCruiser.editConnection",
     "onCommand:dbCruiser.openSqlConsole",
     "onCommand:dbCruiser.runQuery",
+    "onCommand:dbCruiser.explainQuery",
     "onCommand:dbCruiser.selectSchema",
     "onCommand:dbCruiser.refresh",
     "onCommand:dbCruiser.removeConnection",
@@ -101,6 +102,11 @@
         "command": "dbCruiser.runQuery",
         "title": "DB Cruiser: Run Query",
         "icon": "$(play)"
+      },
+      {
+        "command": "dbCruiser.explainQuery",
+        "title": "DB Cruiser: Explain Query",
+        "icon": "$(graph)"
       },
       {
         "command": "dbCruiser.selectSchema",
@@ -258,6 +264,11 @@
           "command": "dbCruiser.runQuery",
           "when": "editorLangId == sql",
           "group": "navigation@2"
+        },
+        {
+          "command": "dbCruiser.explainQuery",
+          "when": "editorLangId == sql",
+          "group": "navigation@3"
         }
       ],
       "editor/context": [
@@ -270,6 +281,11 @@
           "command": "dbCruiser.runQuery",
           "when": "editorLangId == sql",
           "group": "navigation@2"
+        },
+        {
+          "command": "dbCruiser.explainQuery",
+          "when": "editorLangId == sql",
+          "group": "navigation@3"
         }
       ]
     },

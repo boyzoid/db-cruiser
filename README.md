@@ -12,6 +12,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 - Test saved connections before using them.
 - Open a SQL console bound to a selected connection or schema.
 - Choose the active schema and row limit from the console toolbar.
+- Run `EXPLAIN` for SQL and inspect both a flowchart-style visual plan and raw plan details.
 - Copy fully-qualified table and column names from the schema tree.
 - Copy table/view `CREATE` statements and generate `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and foreign-key join SQL templates.
 - Run selected SQL or the whole editor with `Cmd+Enter` on macOS or `Ctrl+Enter` elsewhere.
@@ -32,9 +33,21 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 
 The SQL console opens as a DB Cruiser panel with schema and row limit controls, a SQL editor, run and clear actions, and a results area. It is not backed by a `.sql` file, so closing the console does not prompt you to save a temporary query document.
 
+Use **Explain** from the SQL console, editor title, or editor context menu to run MySQL `EXPLAIN` for one statement at a time. DB Cruiser shows the original SQL, a flowchart-style execution plan, and the raw EXPLAIN result rows.
+
 ## Table Data View
 
 Open a table from the DB Cruiser tree to browse rows in a dedicated data panel. The data view supports paging, adjustable page sizes, column sorting, global search, per-column filters, and copying cells, rows, or current-page column values.
+
+## Pinned For Later
+
+These ideas are parked from the original feature list for future releases:
+
+- Query history, favorites, and saved snippets.
+- Schema-wide search or quick open for tables, views, columns, and routines.
+- Relationship/ER diagram views from foreign keys.
+- Editable table rows with guarded apply/revert workflows.
+- Connection organization with groups, favorites, or recent databases.
 
 ## Commands
 
@@ -47,6 +60,7 @@ DB Cruiser contributes these commands to VS Code:
 - **DB Cruiser: Test Connection**
 - **DB Cruiser: Open SQL Console**
 - **DB Cruiser: Run Query**
+- **DB Cruiser: Explain Query**
 - **DB Cruiser: Select Console Schema**
 - **DB Cruiser: Inspect Object**
 - **DB Cruiser: Open Data View**
