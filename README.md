@@ -8,10 +8,12 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 - Connect directly or through an SSH tunnel with password or private key authentication.
 - Assign connection colors that carry into the tree, DB Cruiser tab icons, SQL console, and result/detail panels.
 - Browse schemas, tables, views, columns, keys, indexes, foreign keys, and triggers.
-- Open table data views directly from the tree.
+- Open table data views with pagination, sorting, global search, per-column filters, and copy actions.
 - Test saved connections before using them.
 - Open a SQL console bound to a selected connection or schema.
 - Choose the active schema and row limit from the console toolbar.
+- Copy fully-qualified table and column names from the schema tree.
+- Copy table/view `CREATE` statements and generate `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and foreign-key join SQL templates.
 - Run selected SQL or the whole editor with `Cmd+Enter` on macOS or `Ctrl+Enter` elsewhere.
 - View query results and object details in a VS Code webview panel.
 
@@ -30,6 +32,10 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 
 The SQL console opens as a DB Cruiser panel with schema and row limit controls, a SQL editor, run and clear actions, and a results area. It is not backed by a `.sql` file, so closing the console does not prompt you to save a temporary query document.
 
+## Table Data View
+
+Open a table from the DB Cruiser tree to browse rows in a dedicated data panel. The data view supports paging, adjustable page sizes, column sorting, global search, per-column filters, and copying cells, rows, or current-page column values.
+
 ## Commands
 
 DB Cruiser contributes these commands to VS Code:
@@ -44,6 +50,13 @@ DB Cruiser contributes these commands to VS Code:
 - **DB Cruiser: Select Console Schema**
 - **DB Cruiser: Inspect Object**
 - **DB Cruiser: Open Data View**
+- **DB Cruiser: Copy Qualified Name**
+- **DB Cruiser: Copy CREATE Statement**
+- **DB Cruiser: Generate SELECT Statement**
+- **DB Cruiser: Generate INSERT Statement**
+- **DB Cruiser: Generate UPDATE Statement**
+- **DB Cruiser: Generate DELETE Statement**
+- **DB Cruiser: Generate JOIN SELECT Statement**
 
 ## Settings
 

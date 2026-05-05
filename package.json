@@ -2,7 +2,7 @@
   "name": "db-cruiser",
   "displayName": "DB Cruiser",
   "description": "A database explorer and SQL console for VS Code.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "stroz-dot-dev",
   "author": "The Stroz",
   "license": "MIT",
@@ -37,7 +37,14 @@
     "onCommand:dbCruiser.removeConnection",
     "onCommand:dbCruiser.testConnection",
     "onCommand:dbCruiser.inspectObject",
-    "onCommand:dbCruiser.selectTop100"
+    "onCommand:dbCruiser.selectTop100",
+    "onCommand:dbCruiser.copyQualifiedName",
+    "onCommand:dbCruiser.copyCreateStatement",
+    "onCommand:dbCruiser.generateSelectStatement",
+    "onCommand:dbCruiser.generateInsertStatement",
+    "onCommand:dbCruiser.generateUpdateStatement",
+    "onCommand:dbCruiser.generateDeleteStatement",
+    "onCommand:dbCruiser.generateJoinSelectStatement"
   ],
   "main": "./src/extension.js",
   "contributes": {
@@ -109,6 +116,41 @@
         "command": "dbCruiser.selectTop100",
         "title": "DB Cruiser: Open Data View",
         "icon": "$(run)"
+      },
+      {
+        "command": "dbCruiser.copyQualifiedName",
+        "title": "DB Cruiser: Copy Qualified Name",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "dbCruiser.copyCreateStatement",
+        "title": "DB Cruiser: Copy CREATE Statement",
+        "icon": "$(clippy)"
+      },
+      {
+        "command": "dbCruiser.generateSelectStatement",
+        "title": "DB Cruiser: Generate SELECT Statement",
+        "icon": "$(code)"
+      },
+      {
+        "command": "dbCruiser.generateInsertStatement",
+        "title": "DB Cruiser: Generate INSERT Statement",
+        "icon": "$(add)"
+      },
+      {
+        "command": "dbCruiser.generateUpdateStatement",
+        "title": "DB Cruiser: Generate UPDATE Statement",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "dbCruiser.generateDeleteStatement",
+        "title": "DB Cruiser: Generate DELETE Statement",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "dbCruiser.generateJoinSelectStatement",
+        "title": "DB Cruiser: Generate JOIN SELECT Statement",
+        "icon": "$(references)"
       }
     ],
     "menus": {
@@ -157,8 +199,53 @@
         },
         {
           "command": "dbCruiser.inspectObject",
-          "when": "view == dbCruiser.connections && viewItem =~ /object/",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:/",
           "group": "inline@2"
+        },
+        {
+          "command": "dbCruiser.copyQualifiedName",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:/",
+          "group": "copy@1"
+        },
+        {
+          "command": "dbCruiser.copyQualifiedName",
+          "when": "view == dbCruiser.connections && viewItem =~ /^column$/",
+          "group": "copy@1"
+        },
+        {
+          "command": "dbCruiser.copyCreateStatement",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:/",
+          "group": "copy@2"
+        },
+        {
+          "command": "dbCruiser.generateSelectStatement",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:/",
+          "group": "generate@1"
+        },
+        {
+          "command": "dbCruiser.generateJoinSelectStatement",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:table/",
+          "group": "generate@2"
+        },
+        {
+          "command": "dbCruiser.generateJoinSelectStatement",
+          "when": "view == dbCruiser.connections && viewItem =~ /^foreignKey$/",
+          "group": "generate@2"
+        },
+        {
+          "command": "dbCruiser.generateInsertStatement",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:table/",
+          "group": "generate@3"
+        },
+        {
+          "command": "dbCruiser.generateUpdateStatement",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:table/",
+          "group": "generate@4"
+        },
+        {
+          "command": "dbCruiser.generateDeleteStatement",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:table/",
+          "group": "generate@5"
         }
       ],
       "editor/title": [

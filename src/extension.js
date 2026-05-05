@@ -17,6 +17,8 @@ const SSH_PASSPHRASE_PREFIX = 'dbCruiser.ssh.passphrase.';
 const DEFAULT_ROW_LIMIT = 500;
 const ROW_LIMIT_OPTIONS = [5, 10, 20, 25, 100, 200, 300, 400, 500];
 const NO_ROW_LIMIT = 'none';
+const DEFAULT_DATA_VIEW_PAGE_SIZE = 100;
+const DATA_VIEW_PAGE_SIZE_OPTIONS = [25, 50, 100, 200, 500];
 const METADATA_CACHE_TTL_MS = 60 * 1000;
 const CONNECTION_COLORS = [
   { id: 'default', label: 'Default', hex: '#8a8a8a', themeColor: undefined },
@@ -45,6 +47,7 @@ function activate(context) {
   const mysql = new MySqlAdapter(context.secrets);
   const provider = new DatabaseTreeProvider(store, mysql);
   const resultView = new ResultView(context.extensionUri);
+  const tableDataView = new TableDataView(mysql, context.extensionUri);
   const sqlCompletionCache = new SqlCompletionMetadataCache(mysql);
   const sqlCompletionProvider = new SqlCompletionProvider(store, consoleSessions, sqlCompletionCache);
   const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions, sqlCompletionCache, context.extensionUri);
@@ -80,7 +83,14 @@ function activate(context) {
       updateStatus();
     }),
     vscode.commands.registerCommand('dbCruiser.inspectObject', (node) => inspectObject(node, mysql, resultView)),
-    vscode.commands.registerCommand('dbCruiser.selectTop100', (node) => selectTop100(node, mysql, resultView)),
+    vscode.commands.registerCommand('dbCruiser.selectTop100', (node) => openTableDataView(node, tableDataView)),
+    vscode.commands.registerCommand('dbCruiser.copyQualifiedName', (node) => copyQualifiedName(node)),
+    vscode.commands.registerCommand('dbCruiser.copyCreateStatement', (node) => copyCreateStatement(node, mysql)),
+    vscode.commands.registerCommand('dbCruiser.generateSelectStatement', (node) => generateSqlTemplate(node, mysql, sqlConsoleView, 'select')),
+    vscode.commands.registerCommand('dbCruiser.generateInsertStatement', (node) => generateSqlTemplate(node, mysql, sqlConsoleView, 'insert')),
+    vscode.commands.registerCommand('dbCruiser.generateUpdateStatement', (node) => generateSqlTemplate(node, mysql, sqlConsoleView, 'update')),
+    vscode.commands.registerCommand('dbCruiser.generateDeleteStatement', (node) => generateSqlTemplate(node, mysql, sqlConsoleView, 'delete')),
+    vscode.commands.registerCommand('dbCruiser.generateJoinSelectStatement', (node) => generateSqlTemplate(node, mysql, sqlConsoleView, 'joinSelect')),
     status
   );
 
@@ -946,6 +956,23 @@ class MySqlAdapter {
       await client.end();
     }
   }
+
+  async tableData(connection, schema, tableName, columns, state) {
+    const client = await this.connect(connection, undefined, { database: schema || connection.database });
+    const query = buildTableDataQuery(schema, tableName, columns, state);
+    try {
+      const [countRows] = await client.query(query.countSql, query.countParams);
+      const [rows] = await client.query(query.dataSql, query.dataParams);
+      const total = Number(countRows?.[0]?.total || 0);
+      return {
+        rows: Array.isArray(rows) ? rows.map((row) => ({ ...row })) : [],
+        total,
+        sql: query.dataSql
+      };
+    } finally {
+      await client.end();
+    }
+  }
 }
 
 class ResultView {
@@ -989,6 +1016,144 @@ class ResultView {
   }
 }
 
+class TableDataView {
+  constructor(mysql, extensionUri) {
+    this.mysql = mysql;
+    this.extensionUri = extensionUri;
+    this.views = new Map();
+  }
+
+  async open(node) {
+    if (!node?.connection || !node.schema || !node.name) {
+      return;
+    }
+
+    const key = dataViewKey(node.connection, node.schema, node.name);
+    let view = this.views.get(key);
+    if (!view) {
+      const panel = vscode.window.createWebviewPanel(
+        'dbCruiser.tableData',
+        `${node.name} Data`,
+        vscode.ViewColumn.Beside,
+        {
+          enableScripts: true,
+          retainContextWhenHidden: true
+        }
+      );
+      panel.iconPath = connectionPanelIconPath(this.extensionUri, node.connection);
+      view = {
+        panel,
+        connection: node.connection,
+        schema: node.schema,
+        tableName: node.name,
+        columns: [],
+        metadataLoaded: false,
+        state: normalizeDataViewState(),
+        result: undefined
+      };
+      this.views.set(key, view);
+      panel.webview.onDidReceiveMessage((message) => this.handleMessage(key, message));
+      panel.onDidDispose(() => this.views.delete(key));
+      panel.webview.html = renderTableDataViewHtml({ view, loading: true });
+    } else {
+      view.panel.reveal(vscode.ViewColumn.Beside);
+    }
+
+    await this.reload(view, view.state, { loadMetadata: true });
+  }
+
+  async handleMessage(key, message) {
+    const view = this.views.get(key);
+    if (!view || !message?.command) {
+      return;
+    }
+
+    if (message.command === 'copyCell') {
+      await this.copyCell(view, message.rowIndex, message.column);
+      return;
+    }
+    if (message.command === 'copyRow') {
+      await this.copyRow(view, message.rowIndex);
+      return;
+    }
+    if (message.command === 'copyColumn') {
+      await this.copyColumn(view, message.column);
+      return;
+    }
+
+    if (message.command !== 'reload') {
+      return;
+    }
+
+    await this.reload(view, message.state);
+  }
+
+  async reload(view, nextState, options = {}) {
+    view.panel.title = `${view.tableName} Data`;
+    view.panel.iconPath = connectionPanelIconPath(this.extensionUri, view.connection);
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Loading ${view.tableName}`,
+        cancellable: false
+      },
+      async () => {
+        try {
+          if (options.loadMetadata || !view.metadataLoaded) {
+            view.columns = await this.mysql.columns(view.connection, view.schema, view.tableName);
+            view.metadataLoaded = true;
+          }
+          view.state = normalizeDataViewState(nextState, view.columns, view.state);
+          const started = Date.now();
+          const result = await this.mysql.tableData(view.connection, view.schema, view.tableName, view.columns, view.state);
+          view.result = {
+            ...result,
+            elapsedMs: Date.now() - started
+          };
+          view.panel.webview.html = renderTableDataViewHtml({ view });
+        } catch (error) {
+          view.panel.webview.html = renderTableDataViewHtml({
+            view,
+            error: errorMessage(error)
+          });
+        }
+      }
+    );
+  }
+
+  async copyCell(view, rowIndex, column) {
+    const row = view.result?.rows?.[Number(rowIndex)];
+    if (!row || !isDataViewColumn(column, view.columns)) {
+      return;
+    }
+
+    await vscode.env.clipboard.writeText(formatDelimitedExportValue(row[column]));
+    vscode.window.showInformationMessage(`Copied ${column} value.`);
+  }
+
+  async copyRow(view, rowIndex) {
+    const row = view.result?.rows?.[Number(rowIndex)];
+    if (!row) {
+      return;
+    }
+
+    await vscode.env.clipboard.writeText(`${JSON.stringify(dataViewRowForCopy(row, view.columns), null, 2)}\n`);
+    vscode.window.showInformationMessage('Copied row.');
+  }
+
+  async copyColumn(view, column) {
+    if (!isDataViewColumn(column, view.columns)) {
+      return;
+    }
+
+    const rows = view.result?.rows || [];
+    const content = rows.map((row) => formatDelimitedExportValue(row[column])).join('\n');
+    await vscode.env.clipboard.writeText(content ? `${content}\n` : '');
+    vscode.window.showInformationMessage(`Copied ${column} values from the current page.`);
+  }
+}
+
 class SqlConsoleView {
   /**
    * @param {MySqlAdapter} mysql
@@ -1004,11 +1169,16 @@ class SqlConsoleView {
     this.panelResults = new WeakMap();
   }
 
-  async open(connection, schema) {
+  async open(connection, schema, options = {}) {
     const selectedSchema = schema || this.consoleSessions.getSavedSchema(connection.id) || connection.database || '';
     const selectedRowLimit = this.consoleSessions.getSavedRowLimit(connection.id);
+    const nextSql = typeof options.sql === 'string' ? options.sql : undefined;
+    const statusMessage = String(options.statusMessage || '');
     if (schema) {
       await this.consoleSessions.setSavedSchema(connection.id, schema);
+    }
+    if (nextSql !== undefined) {
+      await this.consoleSessions.setSavedSql(connection.id, nextSql);
     }
     const key = connection.id;
     const existing = this.panels.get(key);
@@ -1019,7 +1189,9 @@ class SqlConsoleView {
       await existing.panel.webview.postMessage({
         type: 'focus',
         schema: selectedSchema,
-        rowLimit: selectedRowLimit
+        rowLimit: selectedRowLimit,
+        sql: nextSql,
+        statusMessage
       });
       return;
     }
@@ -1050,7 +1222,8 @@ class SqlConsoleView {
       selectedSchema,
       selectedRowLimit,
       schemaError,
-      sql: this.consoleSessions.getSavedSql(connection.id) || ''
+      sql: nextSql ?? (this.consoleSessions.getSavedSql(connection.id) || ''),
+      statusMessage
     });
 
     panel.webview.onDidReceiveMessage(async (message) => {
@@ -1683,26 +1856,293 @@ async function selectSchemaForActiveConsole(store, consoleSessions, mysql) {
   vscode.window.showInformationMessage(`SQL console schema set to ${picked.schema}.`);
 }
 
-async function selectTop100(node, mysql, resultView) {
-  if (!node?.connection || !node.schema || !node.name) {
+async function openTableDataView(node, tableDataView) {
+  await tableDataView.open(node);
+}
+
+async function copyQualifiedName(node) {
+  const qualifiedName = qualifiedNameForNode(node);
+  if (!qualifiedName) {
     return;
   }
 
-  const sql = `select * from ${quoteQualified(node.schema, node.name)} limit 100;`;
+  await vscode.env.clipboard.writeText(qualifiedName);
+  vscode.window.showInformationMessage(`Copied ${qualifiedName}.`);
+}
+
+async function copyCreateStatement(node, mysql) {
+  const context = objectContextFromNode(node);
+  if (!context) {
+    return;
+  }
+
   try {
-    const started = Date.now();
-    const resultSets = await mysql.query(node.connection, sql, node.schema);
-    resultView.show(`${node.name} Data View`, {
-      kind: 'query',
-      connection: node.connection,
-      schema: node.schema,
+    const ddl = await mysql.ddl(context.connection, context.schema, context.objectName, context.objectType);
+    if (!ddl) {
+      vscode.window.showInformationMessage(`No CREATE statement was found for ${context.objectName}.`);
+      return;
+    }
+
+    const statement = ddl.trimEnd();
+    await vscode.env.clipboard.writeText(statement.endsWith(';') ? statement : `${statement};`);
+    vscode.window.showInformationMessage(`Copied CREATE statement for ${context.objectName}.`);
+  } catch (error) {
+    vscode.window.showErrorMessage(errorMessage(error));
+  }
+}
+
+async function generateSqlTemplate(node, mysql, sqlConsoleView, templateType) {
+  const context = objectContextFromNode(node);
+  if (!context) {
+    return;
+  }
+
+  const label = generatedSqlTemplateLabel(templateType);
+  if (context.objectType !== 'table' && !['select'].includes(templateType)) {
+    vscode.window.showInformationMessage(`${label} templates are only available for tables.`);
+    return;
+  }
+
+  try {
+    const sql = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Generating ${label} for ${context.objectName}`,
+        cancellable: false
+      },
+      () => buildGeneratedSqlTemplate(context, mysql, templateType)
+    );
+
+    if (!sql) {
+      vscode.window.showInformationMessage(`No foreign keys were found for ${context.objectName}.`);
+      return;
+    }
+
+    await sqlConsoleView.open(context.connection, context.schema, {
       sql,
-      elapsedMs: Date.now() - started,
-      resultSets
+      statusMessage: `Generated ${label} for ${context.objectName}.`
     });
   } catch (error) {
     vscode.window.showErrorMessage(errorMessage(error));
   }
+}
+
+async function buildGeneratedSqlTemplate(context, mysql, templateType) {
+  if (templateType === 'joinSelect') {
+    const foreignKeys = context.foreignKey
+      ? [context.foreignKey]
+      : await mysql.foreignKeys(context.connection, context.schema, context.objectName);
+    return buildJoinSelectTemplate(context.schema, context.objectName, foreignKeys);
+  }
+
+  const columns = await mysql.columns(context.connection, context.schema, context.objectName);
+  if (templateType === 'select') {
+    return buildSelectTemplate(context.schema, context.objectName, columns);
+  }
+  if (templateType === 'insert') {
+    return buildInsertTemplate(context.schema, context.objectName, columns);
+  }
+
+  const keys = await mysql.keys(context.connection, context.schema, context.objectName);
+  if (templateType === 'update') {
+    return buildUpdateTemplate(context.schema, context.objectName, columns, keys);
+  }
+  if (templateType === 'delete') {
+    return buildDeleteTemplate(context.schema, context.objectName, keys);
+  }
+
+  return '';
+}
+
+function qualifiedNameForNode(node) {
+  if (node?.kind === 'object' && node.schema && node.name) {
+    return quoteQualified(node.schema, node.name);
+  }
+  if (node?.kind === 'column' && node.schema && node.objectName && node.column?.name) {
+    return `${quoteQualified(node.schema, node.objectName)}.${quoteIdentifier(node.column.name)}`;
+  }
+  return '';
+}
+
+function objectContextFromNode(node) {
+  if (node?.kind === 'object' && node.connection && node.schema && node.name && node.objectType) {
+    return {
+      connection: node.connection,
+      schema: node.schema,
+      objectName: node.name,
+      objectType: node.objectType
+    };
+  }
+
+  if (node?.kind === 'foreignKey' && node.connection && node.schema && node.objectName && node.foreignKey) {
+    return {
+      connection: node.connection,
+      schema: node.schema,
+      objectName: node.objectName,
+      objectType: 'table',
+      foreignKey: node.foreignKey
+    };
+  }
+
+  return undefined;
+}
+
+function generatedSqlTemplateLabel(templateType) {
+  return {
+    select: 'SELECT statement',
+    insert: 'INSERT statement',
+    update: 'UPDATE statement',
+    delete: 'DELETE statement',
+    joinSelect: 'JOIN SELECT statement'
+  }[templateType] || 'SQL statement';
+}
+
+function buildSelectTemplate(schema, objectName, columns) {
+  const selectList = columns.length
+    ? formatSqlList(columns, (column) => quoteIdentifier(column.name))
+    : '  *';
+
+  return [
+    'select',
+    selectList,
+    `from ${quoteQualified(schema, objectName)}`,
+    'limit 100;'
+  ].join('\n');
+}
+
+function buildInsertTemplate(schema, objectName, columns) {
+  const writableColumns = columns.filter(isWritableColumn);
+  if (!writableColumns.length) {
+    return `insert into ${quoteQualified(schema, objectName)} ()\nvalues ();`;
+  }
+
+  return [
+    `insert into ${quoteQualified(schema, objectName)} (`,
+    formatSqlList(writableColumns, (column) => quoteIdentifier(column.name)),
+    ') values (',
+    formatSqlList(writableColumns, (column) => sqlValuePlaceholder(column.name)),
+    ');'
+  ].join('\n');
+}
+
+function buildUpdateTemplate(schema, objectName, columns, keys) {
+  const keyColumns = preferredKeyColumns(keys);
+  const keyColumnNames = new Set(keyColumns.map(normalizeColumnName));
+  const writableColumns = columns.filter(isWritableColumn);
+  const assignmentColumns = writableColumns.filter((column) => !keyColumnNames.has(normalizeColumnName(column.name)));
+  const updateColumns = assignmentColumns.length ? assignmentColumns : writableColumns;
+  const assignments = updateColumns.length
+    ? formatSqlList(updateColumns, (column) => `${quoteIdentifier(column.name)} = ${sqlValuePlaceholder(column.name)}`)
+    : '  /* add assignments */';
+
+  return [
+    `update ${quoteQualified(schema, objectName)}`,
+    'set',
+    assignments,
+    buildWhereClause(keyColumns)
+  ].join('\n');
+}
+
+function buildDeleteTemplate(schema, objectName, keys) {
+  return [
+    `delete from ${quoteQualified(schema, objectName)}`,
+    buildWhereClause(preferredKeyColumns(keys))
+  ].join('\n');
+}
+
+function buildJoinSelectTemplate(schema, objectName, foreignKeys) {
+  const joinableKeys = foreignKeys.filter((foreignKey) => foreignKey?.referencedTable);
+  if (!joinableKeys.length) {
+    return '';
+  }
+
+  const baseAlias = 'base';
+  const selectExpressions = [
+    `${baseAlias}.*`,
+    ...joinableKeys.map((_, index) => `${joinAlias(index)}.*`)
+  ];
+  const joins = joinableKeys.map((foreignKey, index) => (
+    buildJoinClause(schema, foreignKey, baseAlias, joinAlias(index))
+  ));
+
+  return [
+    'select',
+    formatSqlList(selectExpressions, (expression) => expression),
+    `from ${quoteQualified(schema, objectName)} as ${baseAlias}`,
+    ...joins
+  ].join('\n') + ';';
+}
+
+function buildJoinClause(schema, foreignKey, baseAlias, targetAlias) {
+  const targetSchema = foreignKey.referencedSchema || schema;
+  const sourceColumns = parseMetadataColumnList(foreignKey.columns);
+  const targetColumns = parseMetadataColumnList(foreignKey.referencedColumns);
+  const pairCount = Math.min(sourceColumns.length, targetColumns.length);
+  const predicates = pairCount > 0
+    ? sourceColumns.slice(0, pairCount).map((column, index) => (
+        `${formatColumnReference(baseAlias, column)} = ${formatColumnReference(targetAlias, targetColumns[index])}`
+      ))
+    : ['1 = 1'];
+
+  return [
+    `left join ${quoteQualified(targetSchema, foreignKey.referencedTable)} as ${targetAlias}`,
+    ...predicates.map((predicate, index) => `  ${index === 0 ? 'on' : 'and'} ${predicate}`)
+  ].join('\n');
+}
+
+function buildWhereClause(columns) {
+  if (!columns.length) {
+    return 'where\n  1 = 0; -- TODO: replace with a row filter';
+  }
+
+  return `where\n${columns.map((column, index) => (
+    `  ${index === 0 ? '' : 'and '}${quoteIdentifier(column)} = ${sqlValuePlaceholder(column)}`
+  )).join('\n')};`;
+}
+
+function formatSqlList(items, formatter) {
+  return items.map((item, index) => {
+    const suffix = index === items.length - 1 ? '' : ',';
+    return `  ${formatter(item)}${suffix}`;
+  }).join('\n');
+}
+
+function preferredKeyColumns(keys) {
+  const primaryKey = keys.find((key) => key.type === 'PRIMARY KEY');
+  const uniqueKey = keys.find((key) => key.type === 'UNIQUE');
+  return parseMetadataColumnList((primaryKey || uniqueKey)?.columns);
+}
+
+function parseMetadataColumnList(value) {
+  return String(value || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function isWritableColumn(column) {
+  const extra = String(column.extra || '').toLowerCase();
+  return !extra.includes('auto_increment') && !/\b(?:virtual|stored)\s+generated\b/.test(extra);
+}
+
+function normalizeColumnName(value) {
+  return String(value || '').toLowerCase();
+}
+
+function sqlValuePlaceholder(columnName) {
+  const label = String(columnName || 'value')
+    .replace(/\*\//g, '* /')
+    .replace(/[\r\n]+/g, ' ')
+    .trim() || 'value';
+  return `/* ${label} */ null`;
+}
+
+function joinAlias(index) {
+  return `fk${index + 1}`;
+}
+
+function formatColumnReference(alias, column) {
+  return `${formatSqlIdentifier(alias)}.${quoteIdentifier(column)}`;
 }
 
 async function pickConnection(store) {
@@ -1798,6 +2238,111 @@ function appendLimitHint(sql, maxRows) {
 
   const withoutSemi = trimmed.replace(/;\s*$/, '');
   return `${withoutSemi}\nlimit ${normalizeRowLimit(maxRows)};`;
+}
+
+function buildTableDataQuery(schema, tableName, columns, state) {
+  const normalizedState = normalizeDataViewState(state, columns);
+  const where = buildTableDataWhereClause(columns, normalizedState);
+  const baseSql = `from ${quoteQualified(schema, tableName)}`;
+  const orderSql = normalizedState.sortColumn
+    ? `\norder by ${quoteIdentifier(normalizedState.sortColumn)} ${normalizedState.sortDirection === 'desc' ? 'desc' : 'asc'}`
+    : '';
+  const offset = normalizedState.page * normalizedState.pageSize;
+
+  return {
+    countSql: `select count(*) as total\n${baseSql}${where.sql}`,
+    countParams: where.params,
+    dataSql: `select *\n${baseSql}${where.sql}${orderSql}\nlimit ${normalizedState.pageSize} offset ${offset}`,
+    dataParams: where.params
+  };
+}
+
+function buildTableDataWhereClause(columns, state) {
+  const clauses = [];
+  const params = [];
+  const filters = state.filters || {};
+
+  for (const column of columns) {
+    const value = filters[column.name];
+    if (!value) {
+      continue;
+    }
+    clauses.push(`${dataViewSearchExpression(column.name)} like ?`);
+    params.push(`%${value}%`);
+  }
+
+  if (state.search && columns.length) {
+    clauses.push(`(${columns.map((column) => `${dataViewSearchExpression(column.name)} like ?`).join(' or ')})`);
+    params.push(...columns.map(() => `%${state.search}%`));
+  }
+
+  return {
+    sql: clauses.length ? `\nwhere ${clauses.join('\n  and ')}` : '',
+    params
+  };
+}
+
+function dataViewSearchExpression(columnName) {
+  return `cast(${quoteIdentifier(columnName)} as char)`;
+}
+
+function normalizeDataViewState(value = {}, columns = [], fallback = {}) {
+  const columnNames = new Set(columns.map((column) => column.name));
+  const pageSize = normalizeDataViewPageSize(value.pageSize ?? fallback.pageSize);
+  const pageNumber = Number(value.page ?? fallback.page ?? 0);
+  const sortColumnCandidate = String(value.sortColumn ?? fallback.sortColumn ?? '');
+  const sortColumn = columnNames.has(sortColumnCandidate) ? sortColumnCandidate : '';
+  const sortDirectionCandidate = String(value.sortDirection ?? fallback.sortDirection ?? 'asc').toLowerCase();
+  const filtersSource = Object.prototype.hasOwnProperty.call(value, 'filters')
+    ? value.filters
+    : fallback.filters || {};
+
+  return {
+    page: Number.isInteger(pageNumber) && pageNumber > 0 ? pageNumber : 0,
+    pageSize,
+    sortColumn,
+    sortDirection: sortDirectionCandidate === 'desc' ? 'desc' : 'asc',
+    search: normalizeDataViewFilterText(value.search ?? fallback.search),
+    filters: normalizeDataViewFilters(filtersSource, columns)
+  };
+}
+
+function normalizeDataViewPageSize(value) {
+  const number = Number(value);
+  return DATA_VIEW_PAGE_SIZE_OPTIONS.includes(number) ? number : DEFAULT_DATA_VIEW_PAGE_SIZE;
+}
+
+function normalizeDataViewFilters(value, columns) {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+
+  return columns.reduce((filters, column) => {
+    const filter = normalizeDataViewFilterText(value[column.name]);
+    if (filter) {
+      filters[column.name] = filter;
+    }
+    return filters;
+  }, {});
+}
+
+function normalizeDataViewFilterText(value) {
+  return String(value || '').trim().slice(0, 240);
+}
+
+function dataViewKey(connection, schema, tableName) {
+  return `${connection.id}:${schema}:${tableName}`;
+}
+
+function isDataViewColumn(columnName, columns) {
+  return columns.some((column) => column.name === columnName);
+}
+
+function dataViewRowForCopy(row, columns) {
+  return columns.reduce((copy, column) => {
+    copy[column.name] = normalizeExportValue(row[column.name]);
+    return copy;
+  }, {});
 }
 
 function normalizeRowLimit(value) {
@@ -2695,10 +3240,10 @@ function suggestedConnectionName({ host, user, database }) {
   return '';
 }
 
-function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRowLimit, schemaError, sql }) {
+function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRowLimit, schemaError, sql, statusMessage }) {
   const nonce = crypto.randomBytes(16).toString('base64');
-  const initialStatus = schemaError ? escapeHtml(schemaError) : '';
-  const initialStatusClass = schemaError ? 'status error' : 'status';
+  const initialStatus = schemaError ? escapeHtml(schemaError) : escapeHtml(statusMessage || '');
+  const initialStatusClass = schemaError ? 'status error' : statusMessage ? 'status success' : 'status';
   const accentColor = escapeHtml(connectionAccentColor(connection));
 
   return `<!doctype html>
@@ -3200,6 +3745,14 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       if (options.complete !== false) {
         requestCompletionSoon();
       }
+    }
+
+    function setSqlText(value) {
+      sql.value = String(value || '');
+      sql.selectionStart = sql.value.length;
+      sql.selectionEnd = sql.value.length;
+      results.innerHTML = '';
+      handleSqlChanged({ complete: false });
     }
 
     function updateHighlight() {
@@ -3877,6 +4430,12 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
         if (message.rowLimit !== undefined) {
           rowLimit.value = message.rowLimit;
         }
+        if (typeof message.sql === 'string') {
+          setSqlText(message.sql);
+        }
+        if (message.statusMessage) {
+          setStatus('success', message.statusMessage);
+        }
         sql.focus();
         return;
       }
@@ -4400,6 +4959,441 @@ function renderConnectionFormHtml({ connection } = {}) {
 </html>`;
 }
 
+function renderTableDataViewHtml({ view, loading = false, error = '' }) {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const accentColor = escapeHtml(connectionAccentColor(view.connection));
+  const state = normalizeDataViewState(view.state, view.columns);
+  const rows = view.result?.rows || [];
+  const total = Number(view.result?.total || 0);
+  const pageCount = dataViewPageCount(total, state.pageSize);
+  const canPrev = state.page > 0;
+  const canNext = (state.page + 1) * state.pageSize < total;
+  const status = error || (loading
+    ? 'Loading rows...'
+    : `${formatDataViewRange(state, rows.length, total)}${view.result ? ` · ${view.result.elapsedMs} ms` : ''}`);
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style nonce="${nonce}">
+    :root {
+      color-scheme: light dark;
+      --border: var(--vscode-panel-border, var(--vscode-editorWidget-border, transparent));
+      --muted: var(--vscode-descriptionForeground, var(--vscode-editor-foreground));
+      --bg-soft: var(--vscode-editorWidget-background, var(--vscode-sideBar-background, var(--vscode-editor-background)));
+      --input-bg: var(--vscode-input-background, var(--vscode-editor-background));
+      --input-fg: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+      --input-border: var(--vscode-input-border, var(--vscode-panel-border, transparent));
+      --button-bg: var(--vscode-button-background, var(--vscode-button-secondaryBackground));
+      --button-fg: var(--vscode-button-foreground, var(--vscode-button-secondaryForeground));
+      --button-hover: var(--vscode-button-hoverBackground, var(--vscode-button-secondaryHoverBackground));
+      --secondary-bg: var(--vscode-button-secondaryBackground);
+      --secondary-fg: var(--vscode-button-secondaryForeground);
+      --secondary-hover: var(--vscode-button-secondaryHoverBackground);
+      --error: var(--vscode-errorForeground, #f14c4c);
+      --connection-color: ${accentColor};
+    }
+    body {
+      margin: 0;
+      color: var(--vscode-editor-foreground);
+      background: var(--vscode-editor-background);
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+    }
+    .data-view {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) minmax(180px, 320px) 110px auto;
+      gap: 10px;
+      align-items: end;
+      border-top: 3px solid var(--connection-color);
+      border-bottom: 1px solid var(--border);
+      padding: 12px;
+      background: var(--bg-soft);
+    }
+    .title {
+      min-width: 0;
+    }
+    h1 {
+      margin: 0 0 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .meta,
+    .status {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    label {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      font-weight: 600;
+    }
+    input,
+    select {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 30px;
+      border: 1px solid var(--input-border);
+      border-radius: 4px;
+      padding: 4px 8px;
+      color: var(--input-fg);
+      background: var(--input-bg);
+      font: inherit;
+      font-weight: 400;
+    }
+    input:focus,
+    select:focus,
+    button:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+    button {
+      border: 0;
+      border-radius: 4px;
+      min-height: 30px;
+      padding: 5px 10px;
+      color: var(--button-fg);
+      background: var(--button-bg);
+      font: inherit;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button:hover {
+      background: var(--button-hover);
+    }
+    button.secondary,
+    .mini-button {
+      color: var(--secondary-fg);
+      background: var(--secondary-bg);
+    }
+    button.secondary:hover,
+    .mini-button:hover {
+      background: var(--secondary-hover);
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+    .actions,
+    .pager {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .pager-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid var(--border);
+      padding: 8px 12px;
+      background: var(--vscode-editor-background);
+    }
+    .status.error {
+      color: var(--error);
+    }
+    .grid-wrap {
+      overflow: auto;
+    }
+    table {
+      border-collapse: collapse;
+      min-width: 100%;
+      background: var(--vscode-editor-background);
+    }
+    th,
+    td {
+      border-right: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 0;
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--bg-soft);
+      font-weight: 600;
+    }
+    tr.filters th {
+      top: 34px;
+      z-index: 1;
+      padding: 5px;
+    }
+    .row-action {
+      width: 1%;
+      min-width: 58px;
+      padding: 5px;
+      background: var(--bg-soft);
+    }
+    .column-head {
+      display: grid;
+      grid-template-columns: minmax(90px, 1fr) auto auto;
+      gap: 4px;
+      align-items: center;
+      min-height: 33px;
+      padding: 0 5px 0 8px;
+    }
+    .column-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .mini-button {
+      min-height: 22px;
+      padding: 2px 6px;
+      font-size: 11px;
+    }
+    .filter-input {
+      min-width: 130px;
+      min-height: 26px;
+      padding: 3px 6px;
+    }
+    .cell {
+      max-width: 420px;
+      overflow: hidden;
+      padding: 6px 8px;
+      text-overflow: ellipsis;
+      cursor: copy;
+    }
+    .cell:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .empty {
+      color: var(--muted);
+      padding: 18px;
+    }
+    @media (max-width: 820px) {
+      .toolbar {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+      .pager-bar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="data-view">
+    <section class="toolbar">
+      <div class="title">
+        <h1>${escapeHtml(view.tableName)}</h1>
+        <div class="meta">${escapeHtml(view.connection.name)} · ${escapeHtml(view.schema)}</div>
+      </div>
+      <label>
+        Search
+        <input id="search" value="${escapeHtml(state.search)}" autocomplete="off">
+      </label>
+      <label>
+        Page Size
+        <select id="page-size">
+          ${renderDataViewPageSizeOptions(state.pageSize)}
+        </select>
+      </label>
+      <div class="actions">
+        <button id="apply" type="button">Apply</button>
+        <button id="clear" class="secondary" type="button">Clear</button>
+        <button id="refresh" class="secondary" type="button">Refresh</button>
+      </div>
+    </section>
+    <section class="pager-bar">
+      <div class="status${error ? ' error' : ''}" role="status" aria-live="polite">${escapeHtml(status)}</div>
+      <div class="pager">
+        <button id="prev" class="secondary" type="button"${canPrev ? '' : ' disabled'}>Prev</button>
+        <span class="meta">Page ${Math.min(state.page + 1, pageCount)} of ${pageCount}</span>
+        <button id="next" class="secondary" type="button"${canNext ? '' : ' disabled'}>Next</button>
+      </div>
+    </section>
+    <section class="grid-wrap">
+      ${renderTableDataGrid(view.columns, rows, state, loading, error)}
+    </section>
+  </main>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const state = ${scriptJson(state)};
+
+    function collectState(overrides = {}) {
+      const filters = {};
+      document.querySelectorAll('[data-filter-column]').forEach((input) => {
+        const value = input.value.trim();
+        if (value) {
+          filters[input.dataset.filterColumn] = value;
+        }
+      });
+      return {
+        ...state,
+        search: document.getElementById('search')?.value.trim() || '',
+        pageSize: Number(document.getElementById('page-size')?.value || state.pageSize),
+        filters,
+        ...overrides
+      };
+    }
+
+    function reload(overrides = {}) {
+      vscode.postMessage({
+        command: 'reload',
+        state: collectState(overrides)
+      });
+    }
+
+    document.getElementById('apply')?.addEventListener('click', () => reload({ page: 0 }));
+    document.getElementById('refresh')?.addEventListener('click', () => reload());
+    document.getElementById('clear')?.addEventListener('click', () => {
+      const search = document.getElementById('search');
+      if (search) {
+        search.value = '';
+      }
+      document.querySelectorAll('[data-filter-column]').forEach((input) => {
+        input.value = '';
+      });
+      reload({ page: 0, search: '', filters: {} });
+    });
+    document.getElementById('page-size')?.addEventListener('change', () => reload({ page: 0 }));
+    document.getElementById('prev')?.addEventListener('click', () => reload({ page: Math.max(0, state.page - 1) }));
+    document.getElementById('next')?.addEventListener('click', () => reload({ page: state.page + 1 }));
+    document.getElementById('search')?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        reload({ page: 0 });
+      }
+    });
+    document.querySelectorAll('[data-filter-column]').forEach((input) => {
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          reload({ page: 0 });
+        }
+      });
+    });
+    document.addEventListener('click', (event) => {
+      const sort = event.target?.closest?.('[data-sort-column]');
+      if (sort) {
+        const column = sort.dataset.sortColumn;
+        const direction = state.sortColumn === column && state.sortDirection === 'asc' ? 'desc' : 'asc';
+        reload({ page: 0, sortColumn: column, sortDirection: direction });
+        return;
+      }
+
+      const columnCopy = event.target?.closest?.('[data-copy-column]');
+      if (columnCopy) {
+        vscode.postMessage({ command: 'copyColumn', column: columnCopy.dataset.copyColumn });
+        return;
+      }
+
+      const rowCopy = event.target?.closest?.('[data-copy-row]');
+      if (rowCopy) {
+        vscode.postMessage({ command: 'copyRow', rowIndex: Number(rowCopy.dataset.copyRow) });
+        return;
+      }
+
+      const cell = event.target?.closest?.('[data-cell-column]');
+      if (cell) {
+        vscode.postMessage({
+          command: 'copyCell',
+          rowIndex: Number(cell.dataset.cellRow),
+          column: cell.dataset.cellColumn
+        });
+      }
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderDataViewPageSizeOptions(selectedPageSize) {
+  return DATA_VIEW_PAGE_SIZE_OPTIONS.map((value) => (
+    `<option value="${value}"${value === selectedPageSize ? ' selected' : ''}>${value}</option>`
+  )).join('');
+}
+
+function renderTableDataGrid(columns, rows, state, loading, error) {
+  if (loading || error || !columns.length) {
+    const message = loading
+      ? 'Loading rows...'
+      : error || 'No columns found.';
+    return `<div class="empty">${escapeHtml(message)}</div>`;
+  }
+
+  const head = columns.map((column) => renderTableDataHeader(column, state)).join('');
+  const filters = columns.map((column) => (
+    `<th><input class="filter-input" data-filter-column="${escapeHtml(column.name)}" value="${escapeHtml(state.filters[column.name] || '')}" autocomplete="off"></th>`
+  )).join('');
+  const body = rows.length
+    ? rows.map((row, rowIndex) => renderTableDataRow(row, columns, rowIndex)).join('')
+    : `<tr><td class="empty" colspan="${columns.length + 1}">No rows match the current view.</td></tr>`;
+
+  return `<table>
+    <thead>
+      <tr>
+        <th class="row-action">Row</th>
+        ${head}
+      </tr>
+      <tr class="filters">
+        <th class="row-action"></th>
+        ${filters}
+      </tr>
+    </thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
+function renderTableDataHeader(column, state) {
+  const isSorted = state.sortColumn === column.name;
+  const sortLabel = isSorted ? (state.sortDirection === 'desc' ? 'Desc' : 'Asc') : 'Sort';
+  return `<th>
+    <div class="column-head">
+      <span class="column-name" title="${escapeHtml(column.name)}">${escapeHtml(column.name)}</span>
+      <button class="mini-button" type="button" data-sort-column="${escapeHtml(column.name)}">${sortLabel}</button>
+      <button class="mini-button" type="button" data-copy-column="${escapeHtml(column.name)}">Copy</button>
+    </div>
+  </th>`;
+}
+
+function renderTableDataRow(row, columns, rowIndex) {
+  const cells = columns.map((column) => {
+    const value = formatCell(row[column.name]);
+    return `<td>
+      <div class="cell" data-cell-row="${rowIndex}" data-cell-column="${escapeHtml(column.name)}" title="Copy cell">${escapeHtml(value)}</div>
+    </td>`;
+  }).join('');
+
+  return `<tr>
+    <th class="row-action"><button class="mini-button" type="button" data-copy-row="${rowIndex}">Copy</button></th>
+    ${cells}
+  </tr>`;
+}
+
+function dataViewPageCount(total, pageSize) {
+  return Math.max(1, Math.ceil(total / pageSize));
+}
+
+function formatDataViewRange(state, rowCount, total) {
+  if (!total) {
+    return '0 rows';
+  }
+  if (!rowCount) {
+    return `0 of ${total} rows`;
+  }
+  const start = state.page * state.pageSize + 1;
+  const end = Math.min(start + rowCount - 1, total);
+  return `${start}-${end} of ${total} rows`;
+}
+
 function renderResultHtml(result) {
   const nonce = crypto.randomBytes(16).toString('base64');
   const body = result.kind === 'object' ? renderObjectDetails(result) : renderQueryResults(result);
@@ -4757,6 +5751,15 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function scriptJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 module.exports = {

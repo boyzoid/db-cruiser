@@ -1,5 +1,10 @@
 # Change Log
 
+## 0.3.0
+
+- Upgraded table data views with pagination, adjustable page sizes, sorting, global search, per-column filters, and copy actions for cells, rows, and current-page column values.
+- Added schema tree actions to copy qualified names, copy table/view CREATE statements, and generate SELECT, INSERT, UPDATE, DELETE, and foreign-key JOIN SELECT templates.
+
 ## 0.2.1
 
 - Improved SQL console syntax highlighting so token colors remain visible across themes.
