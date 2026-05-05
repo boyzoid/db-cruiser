@@ -2,7 +2,7 @@
   "name": "db-cruiser",
   "displayName": "DB Cruiser",
   "description": "A database explorer and SQL console for VS Code.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "stroz-dot-dev",
   "author": "The Stroz",
   "license": "MIT",

@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.4.1
+
+- Refreshed the Marketplace README content.
+
 ## 0.4.0
 
 - Added EXPLAIN support from SQL editors and the SQL console, including a visual execution-plan flow and raw plan details.
