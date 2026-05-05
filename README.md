@@ -39,16 +39,6 @@ Use **Explain** from the SQL console, editor title, or editor context menu to ru
 
 Open a table from the DB Cruiser tree to browse rows in a dedicated data panel. The data view supports paging, adjustable page sizes, column sorting, global search, per-column filters, and copying cells, rows, or current-page column values.
 
-## Pinned For Later
-
-These ideas are parked from the original feature list for future releases:
-
-- Query history, favorites, and saved snippets.
-- Schema-wide search or quick open for tables, views, columns, and routines.
-- Relationship/ER diagram views from foreign keys.
-- Editable table rows with guarded apply/revert workflows.
-- Connection organization with groups, favorites, or recent databases.
-
 ## Commands
 
 DB Cruiser contributes these commands to VS Code:
