@@ -2710,29 +2710,65 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
   <style nonce="${nonce}">
     :root {
       color-scheme: light dark;
-      --border: var(--vscode-panel-border);
-      --muted: var(--vscode-descriptionForeground);
-      --bg-soft: var(--vscode-editorWidget-background);
-      --input-bg: var(--vscode-input-background);
-      --input-fg: var(--vscode-input-foreground);
-      --input-border: var(--vscode-input-border);
-      --button-bg: var(--vscode-button-background);
-      --button-fg: var(--vscode-button-foreground);
-      --button-hover: var(--vscode-button-hoverBackground);
-      --error: var(--vscode-errorForeground);
-      --success: var(--vscode-testing-iconPassed);
-      --suggest-bg: var(--vscode-editorSuggestWidget-background);
-      --suggest-fg: var(--vscode-editorSuggestWidget-foreground);
-      --suggest-border: var(--vscode-editorSuggestWidget-border);
-      --suggest-selected: var(--vscode-editorSuggestWidget-selectedBackground);
-      --sql-keyword: var(--vscode-symbolIcon-keywordForeground, #569cd6);
-      --sql-function: var(--vscode-symbolIcon-functionForeground, #dcdcaa);
-      --sql-string: var(--vscode-symbolIcon-stringForeground, #ce9178);
-      --sql-number: var(--vscode-symbolIcon-numberForeground, #b5cea8);
-      --sql-comment: var(--vscode-descriptionForeground);
-      --sql-identifier: var(--vscode-symbolIcon-variableForeground, #9cdcfe);
-      --sql-operator: var(--vscode-symbolIcon-operatorForeground, #d4d4d4);
+      --border: var(--vscode-panel-border, var(--vscode-editorWidget-border, transparent));
+      --muted: var(--vscode-descriptionForeground, var(--vscode-editor-foreground));
+      --bg-soft: var(--vscode-editorWidget-background, var(--vscode-sideBar-background, var(--vscode-editor-background)));
+      --input-bg: var(--vscode-input-background, var(--vscode-editor-background));
+      --input-fg: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+      --input-border: var(--vscode-input-border, var(--vscode-panel-border, transparent));
+      --button-bg: var(--vscode-button-background, var(--vscode-button-secondaryBackground));
+      --button-fg: var(--vscode-button-foreground, var(--vscode-button-secondaryForeground));
+      --button-hover: var(--vscode-button-hoverBackground, var(--vscode-button-secondaryHoverBackground));
+      --error: var(--vscode-errorForeground, #f14c4c);
+      --success: var(--vscode-testing-iconPassed, #73c991);
+      --suggest-bg: var(--vscode-editorSuggestWidget-background, var(--vscode-editorWidget-background, var(--vscode-editor-background)));
+      --suggest-fg: var(--vscode-editorSuggestWidget-foreground, var(--vscode-editor-foreground));
+      --suggest-border: var(--vscode-editorSuggestWidget-border, var(--vscode-panel-border, transparent));
+      --suggest-selected: var(--vscode-editorSuggestWidget-selectedBackground, var(--vscode-list-activeSelectionBackground));
+      --sql-keyword: #569cd6;
+      --sql-function: #dcdcaa;
+      --sql-string: #ce9178;
+      --sql-number: #b5cea8;
+      --sql-comment: #6a9955;
+      --sql-identifier: #9cdcfe;
+      --sql-operator: #d4d4d4;
       --connection-color: ${accentColor};
+    }
+    body.vscode-light {
+      --sql-keyword: #0000ff;
+      --sql-function: #795e26;
+      --sql-string: #a31515;
+      --sql-number: #098658;
+      --sql-comment: #008000;
+      --sql-identifier: #267f99;
+      --sql-operator: #000000;
+    }
+    body.vscode-dark {
+      --sql-keyword: #569cd6;
+      --sql-function: #dcdcaa;
+      --sql-string: #ce9178;
+      --sql-number: #b5cea8;
+      --sql-comment: #6a9955;
+      --sql-identifier: #9cdcfe;
+      --sql-operator: #d4d4d4;
+    }
+    body.vscode-high-contrast {
+      --sql-keyword: #75beff;
+      --sql-function: #ffff66;
+      --sql-string: #ffab70;
+      --sql-number: #7ee787;
+      --sql-comment: #a5a5a5;
+      --sql-identifier: #9cdcfe;
+      --sql-operator: var(--vscode-editor-foreground, #ffffff);
+    }
+    body.vscode-high-contrast-light {
+      --sql-keyword: #0000ff;
+      --sql-function: #795e26;
+      --sql-string: #a31515;
+      --sql-number: #098658;
+      --sql-comment: #008000;
+      --sql-identifier: #267f99;
+      --sql-operator: var(--vscode-editor-foreground, #000000);
     }
     body {
       margin: 0;
@@ -2842,6 +2878,11 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       background: transparent;
       caret-color: var(--input-fg);
       -webkit-text-fill-color: transparent;
+    }
+    @media (forced-colors: active) {
+      .sql-highlight, .sql-token, textarea {
+        forced-color-adjust: none;
+      }
     }
     textarea::selection {
       background: var(--vscode-editor-selectionBackground);

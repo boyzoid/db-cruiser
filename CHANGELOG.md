@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.2.1
+
+- Improved SQL console syntax highlighting so token colors remain visible across themes.
+
 ## 0.2.0
 
 - Added optional SSH tunneling for MySQL connections with password or private key authentication.
