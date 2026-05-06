@@ -13,6 +13,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 ### Schema Explorer
 
 - Browse schemas, tables, views, columns, keys, indexes, foreign keys, and triggers.
+- Open a SQL console directly from a table with that table's schema selected.
 - Open object details and copy fully qualified table or column names.
 - Copy table/view `CREATE` statements.
 - Generate `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and foreign-key join SQL templates from the schema tree.
@@ -27,7 +28,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 
 ### Table Data View
 
-- Browse table rows in a dedicated data view.
+- Browse table rows in dedicated data-view tabs that open in the active editor group.
 - Page through results, adjust page size, sort columns, search globally, and apply per-column filters.
 - Copy cells, rows, or current-page column values.
 

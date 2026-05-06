@@ -1063,7 +1063,7 @@ class TableDataView {
       const panel = vscode.window.createWebviewPanel(
         'dbCruiser.tableData',
         `${node.name} Data`,
-        vscode.ViewColumn.Beside,
+        vscode.ViewColumn.Active,
         {
           enableScripts: true,
           retainContextWhenHidden: true
@@ -1085,7 +1085,7 @@ class TableDataView {
       panel.onDidDispose(() => this.views.delete(key));
       panel.webview.html = renderTableDataViewHtml({ view, loading: true });
     } else {
-      view.panel.reveal(vscode.ViewColumn.Beside);
+      view.panel.reveal(vscode.ViewColumn.Active);
     }
 
     await this.reload(view, view.state, { loadMetadata: true });

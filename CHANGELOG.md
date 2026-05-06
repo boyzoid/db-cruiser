@@ -1,5 +1,10 @@
 # Change Log
 
+## 0.4.2
+
+- Added a table-row SQL Console action that opens the console with the table's schema selected.
+- Updated table data views to open in the active editor group instead of creating a side-by-side split.
+
 ## 0.4.1
 
 - Refreshed the Marketplace README content.

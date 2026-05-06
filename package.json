@@ -2,7 +2,7 @@
   "name": "db-cruiser",
   "displayName": "DB Cruiser",
   "description": "A database explorer and SQL console for VS Code.",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "stroz-dot-dev",
   "author": "The Stroz",
   "license": "MIT",
@@ -204,9 +204,14 @@
           "group": "inline@1"
         },
         {
+          "command": "dbCruiser.openSqlConsole",
+          "when": "view == dbCruiser.connections && viewItem =~ /object:table/",
+          "group": "inline@2"
+        },
+        {
           "command": "dbCruiser.inspectObject",
           "when": "view == dbCruiser.connections && viewItem =~ /object:/",
-          "group": "inline@2"
+          "group": "inline@3"
         },
         {
           "command": "dbCruiser.copyQualifiedName",
