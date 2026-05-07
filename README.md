@@ -29,8 +29,8 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 ### Table Data View
 
 - Browse table rows in dedicated data-view tabs that open in the active editor group.
-- Page through results, adjust page size, sort columns, search globally, and apply per-column filters.
-- Copy cells, rows, or current-page column values.
+- Page through results, adjust page size, cycle column sorting with compact icon controls, and filter with a code-hinted `WHERE` expression.
+- Copy cells, rows, or current-page column values with streamlined copy controls.
 
 ## Getting Started
 

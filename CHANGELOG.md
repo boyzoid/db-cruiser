@@ -1,5 +1,11 @@
 # Change Log
 
+## 0.4.3
+
+- Replaced per-column table data filters and global search with a single code-hinted toolbar `WHERE` expression.
+- Changed table data sort controls to tri-state icon buttons for unsorted, ascending, and descending states.
+- Swapped table data copy controls to icon-only buttons.
+
 ## 0.4.2
 
 - Added a table-row SQL Console action that opens the console with the table's schema selected.

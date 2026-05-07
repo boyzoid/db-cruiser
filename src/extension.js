@@ -1109,6 +1109,10 @@ class TableDataView {
       await this.copyColumn(view, message.column);
       return;
     }
+    if (message.command === 'completion') {
+      await this.complete(view, message.where, message.offset, message.requestId);
+      return;
+    }
 
     if (message.command !== 'reload') {
       return;
@@ -1149,6 +1153,27 @@ class TableDataView {
         }
       }
     );
+  }
+
+  async complete(view, where, offset, requestId) {
+    const source = String(where || '');
+    const fallback = {
+      type: 'completion',
+      requestId,
+      replaceStart: clampOffset(offset, source),
+      replaceEnd: clampOffset(offset, source),
+      items: []
+    };
+
+    try {
+      await view.panel.webview.postMessage({
+        type: 'completion',
+        requestId,
+        ...buildTableWhereCompletionSuggestions(view.schema, view.tableName, view.columns, source, offset)
+      });
+    } catch {
+      await view.panel.webview.postMessage(fallback);
+    }
   }
 
   async copyCell(view, rowIndex, column) {
@@ -2406,7 +2431,7 @@ function appendLimitHint(sql, maxRows) {
 
 function buildTableDataQuery(schema, tableName, columns, state) {
   const normalizedState = normalizeDataViewState(state, columns);
-  const where = buildTableDataWhereClause(columns, normalizedState);
+  const where = buildTableDataWhereClause(normalizedState);
   const baseSql = `from ${quoteQualified(schema, tableName)}`;
   const orderSql = normalizedState.sortColumn
     ? `\norder by ${quoteIdentifier(normalizedState.sortColumn)} ${normalizedState.sortDirection === 'desc' ? 'desc' : 'asc'}`
@@ -2421,33 +2446,19 @@ function buildTableDataQuery(schema, tableName, columns, state) {
   };
 }
 
-function buildTableDataWhereClause(columns, state) {
+function buildTableDataWhereClause(state) {
   const clauses = [];
   const params = [];
-  const filters = state.filters || {};
+  const whereExpression = normalizeDataViewWhereExpression(state.where);
 
-  for (const column of columns) {
-    const value = filters[column.name];
-    if (!value) {
-      continue;
-    }
-    clauses.push(`${dataViewSearchExpression(column.name)} like ?`);
-    params.push(`%${value}%`);
-  }
-
-  if (state.search && columns.length) {
-    clauses.push(`(${columns.map((column) => `${dataViewSearchExpression(column.name)} like ?`).join(' or ')})`);
-    params.push(...columns.map(() => `%${state.search}%`));
+  if (whereExpression) {
+    clauses.push(`(${whereExpression})`);
   }
 
   return {
     sql: clauses.length ? `\nwhere ${clauses.join('\n  and ')}` : '',
     params
   };
-}
-
-function dataViewSearchExpression(columnName) {
-  return `cast(${quoteIdentifier(columnName)} as char)`;
 }
 
 function normalizeDataViewState(value = {}, columns = [], fallback = {}) {
@@ -2457,17 +2468,13 @@ function normalizeDataViewState(value = {}, columns = [], fallback = {}) {
   const sortColumnCandidate = String(value.sortColumn ?? fallback.sortColumn ?? '');
   const sortColumn = columnNames.has(sortColumnCandidate) ? sortColumnCandidate : '';
   const sortDirectionCandidate = String(value.sortDirection ?? fallback.sortDirection ?? 'asc').toLowerCase();
-  const filtersSource = Object.prototype.hasOwnProperty.call(value, 'filters')
-    ? value.filters
-    : fallback.filters || {};
 
   return {
     page: Number.isInteger(pageNumber) && pageNumber > 0 ? pageNumber : 0,
     pageSize,
     sortColumn,
     sortDirection: sortDirectionCandidate === 'desc' ? 'desc' : 'asc',
-    search: normalizeDataViewFilterText(value.search ?? fallback.search),
-    filters: normalizeDataViewFilters(filtersSource, columns)
+    where: normalizeDataViewWhereText(value.where ?? fallback.where)
   };
 }
 
@@ -2476,22 +2483,91 @@ function normalizeDataViewPageSize(value) {
   return DATA_VIEW_PAGE_SIZE_OPTIONS.includes(number) ? number : DEFAULT_DATA_VIEW_PAGE_SIZE;
 }
 
-function normalizeDataViewFilters(value, columns) {
-  if (!value || typeof value !== 'object') {
-    return {};
-  }
-
-  return columns.reduce((filters, column) => {
-    const filter = normalizeDataViewFilterText(value[column.name]);
-    if (filter) {
-      filters[column.name] = filter;
-    }
-    return filters;
-  }, {});
+function normalizeDataViewWhereText(value) {
+  return String(value || '').trim().slice(0, 2000);
 }
 
-function normalizeDataViewFilterText(value) {
-  return String(value || '').trim().slice(0, 240);
+function normalizeDataViewWhereExpression(value) {
+  let expression = normalizeDataViewWhereText(value)
+    .replace(/^where\b/i, '')
+    .trim()
+    .replace(/;\s*$/, '')
+    .trim();
+
+  if (!expression) {
+    return '';
+  }
+  if (hasUnquotedSqlCharacter(expression, ';')) {
+    throw new Error('The table data WHERE filter cannot contain multiple SQL statements.');
+  }
+  if (hasUnquotedSqlCharacter(expression, '?')) {
+    throw new Error('The table data WHERE filter cannot use ? placeholders. Enter literal values instead.');
+  }
+
+  return expression;
+}
+
+function hasUnquotedSqlCharacter(text, target) {
+  let quote = '';
+
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+
+    if (quote) {
+      if (character === '\\') {
+        index += 1;
+        continue;
+      }
+      if (character === quote) {
+        if (text[index + 1] === quote) {
+          index += 1;
+        } else {
+          quote = '';
+        }
+      }
+      continue;
+    }
+
+    if (character === '\'' || character === '"' || character === '`') {
+      quote = character;
+      continue;
+    }
+    if (character === target) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildTableWhereCompletionSuggestions(schema, tableName, columns, where, offset) {
+  const source = String(where || '');
+  const safeOffset = clampOffset(offset, source);
+  const prefix = `select *\nfrom ${quoteQualified(schema, tableName)}\nwhere `;
+  const suggestions = buildSqlCompletionSuggestions(
+    `${prefix}${source}`,
+    prefix.length + safeOffset,
+    buildTableDataCompletionMetadata(schema, tableName, columns)
+  );
+
+  return {
+    ...suggestions,
+    replaceStart: Math.max(0, suggestions.replaceStart - prefix.length),
+    replaceEnd: Math.max(0, suggestions.replaceEnd - prefix.length)
+  };
+}
+
+function buildTableDataCompletionMetadata(schema, tableName, columns) {
+  const metadata = emptyCompletionMetadata(schema);
+  const object = {
+    name: tableName,
+    type: 'table',
+    columns: columns.map((column) => ({ ...column }))
+  };
+
+  metadata.objects.push(object);
+  metadata.byLowerName.set(String(tableName || '').toLowerCase(), object);
+  return metadata;
 }
 
 function dataViewKey(connection, schema, tableName) {
@@ -5448,6 +5524,10 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
       --secondary-fg: var(--vscode-button-secondaryForeground);
       --secondary-hover: var(--vscode-button-secondaryHoverBackground);
       --error: var(--vscode-errorForeground, #f14c4c);
+      --suggest-bg: var(--vscode-editorSuggestWidget-background, var(--vscode-editorWidget-background, var(--vscode-editor-background)));
+      --suggest-fg: var(--vscode-editorSuggestWidget-foreground, var(--vscode-editor-foreground));
+      --suggest-border: var(--vscode-editorSuggestWidget-border, var(--vscode-panel-border, transparent));
+      --suggest-selected: var(--vscode-editorSuggestWidget-selectedBackground, var(--vscode-list-activeSelectionBackground));
       --connection-color: ${accentColor};
     }
     body {
@@ -5464,7 +5544,7 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
     }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(180px, 1fr) minmax(180px, 320px) 110px auto;
+      grid-template-columns: minmax(160px, 0.8fr) minmax(300px, 1.6fr) 110px auto;
       gap: 10px;
       align-items: end;
       border-top: 3px solid var(--connection-color);
@@ -5493,6 +5573,61 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
       gap: 4px;
       min-width: 0;
       font-weight: 600;
+    }
+    .where-field {
+      min-width: 240px;
+    }
+    .where-field input {
+      font-family: var(--vscode-editor-font-family, var(--vscode-font-family));
+    }
+    .completion-list {
+      position: fixed;
+      z-index: 20;
+      box-sizing: border-box;
+      min-width: 260px;
+      max-width: min(560px, calc(100vw - 24px));
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid var(--suggest-border);
+      color: var(--suggest-fg);
+      background: var(--suggest-bg);
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+    }
+    .completion-list[hidden] {
+      display: none;
+    }
+    .completion-item {
+      display: grid;
+      grid-template-columns: 58px minmax(0, 1fr);
+      gap: 8px;
+      width: 100%;
+      padding: 5px 8px;
+      box-sizing: border-box;
+      cursor: default;
+    }
+    .completion-item.active {
+      background: var(--suggest-selected);
+    }
+    .completion-kind {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    .completion-main {
+      min-width: 0;
+    }
+    .completion-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .completion-detail {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     input,
     select {
@@ -5583,11 +5718,6 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
       background: var(--bg-soft);
       font-weight: 600;
     }
-    tr.filters th {
-      top: 34px;
-      z-index: 1;
-      padding: 5px;
-    }
     .row-action {
       width: 1%;
       min-width: 58px;
@@ -5611,10 +5741,34 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
       padding: 2px 6px;
       font-size: 11px;
     }
-    .filter-input {
-      min-width: 130px;
-      min-height: 26px;
-      padding: 3px 6px;
+    .sort-button {
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      min-width: 24px;
+      padding: 2px;
+      line-height: 1;
+    }
+    .sort-button.active {
+      color: var(--button-fg);
+      background: var(--button-bg);
+    }
+    .sort-icon {
+      font-size: 14px;
+      line-height: 1;
+    }
+    .icon-button {
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      min-width: 24px;
+      padding: 2px;
+      line-height: 1;
+    }
+    .button-icon {
+      width: 14px;
+      height: 14px;
+      pointer-events: none;
     }
     .cell {
       max-width: 420px;
@@ -5649,9 +5803,9 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
         <h1>${escapeHtml(view.tableName)}</h1>
         <div class="meta">${escapeHtml(view.connection.name)} · ${escapeHtml(view.schema)}</div>
       </div>
-      <label>
-        Search
-        <input id="search" value="${escapeHtml(state.search)}" autocomplete="off">
+      <label class="where-field">
+        WHERE
+        <input id="where" value="${escapeHtml(state.where)}" placeholder="id = 1 and status = 'active'" autocomplete="off" spellcheck="false">
       </label>
       <label>
         Page Size
@@ -5676,24 +5830,27 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
     <section class="grid-wrap">
       ${renderTableDataGrid(view.columns, rows, state, loading, error)}
     </section>
+    <div id="completion-list" class="completion-list" role="listbox" hidden></div>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const state = ${scriptJson(state)};
+    const whereInput = document.getElementById('where');
+    const completionList = document.getElementById('completion-list');
+    let completionTimer;
+    let completionRequestId = 0;
+    let completionState = {
+      items: [],
+      selectedIndex: 0,
+      replaceStart: 0,
+      replaceEnd: 0
+    };
 
     function collectState(overrides = {}) {
-      const filters = {};
-      document.querySelectorAll('[data-filter-column]').forEach((input) => {
-        const value = input.value.trim();
-        if (value) {
-          filters[input.dataset.filterColumn] = value;
-        }
-      });
       return {
         ...state,
-        search: document.getElementById('search')?.value.trim() || '',
+        where: whereInput?.value.trim() || '',
         pageSize: Number(document.getElementById('page-size')?.value || state.pageSize),
-        filters,
         ...overrides
       };
     }
@@ -5708,38 +5865,69 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
     document.getElementById('apply')?.addEventListener('click', () => reload({ page: 0 }));
     document.getElementById('refresh')?.addEventListener('click', () => reload());
     document.getElementById('clear')?.addEventListener('click', () => {
-      const search = document.getElementById('search');
-      if (search) {
-        search.value = '';
+      if (whereInput) {
+        whereInput.value = '';
       }
-      document.querySelectorAll('[data-filter-column]').forEach((input) => {
-        input.value = '';
-      });
-      reload({ page: 0, search: '', filters: {} });
+      hideCompletion();
+      reload({ page: 0, where: '' });
     });
     document.getElementById('page-size')?.addEventListener('change', () => reload({ page: 0 }));
     document.getElementById('prev')?.addEventListener('click', () => reload({ page: Math.max(0, state.page - 1) }));
     document.getElementById('next')?.addEventListener('click', () => reload({ page: state.page + 1 }));
-    document.getElementById('search')?.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        reload({ page: 0 });
+    whereInput?.addEventListener('input', () => {
+      hideCompletion();
+      requestCompletionSoon();
+    });
+    whereInput?.addEventListener('click', () => {
+      if (!completionList.hidden) {
+        requestCompletionSoon();
       }
     });
-    document.querySelectorAll('[data-filter-column]').forEach((input) => {
-      input.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') {
+    whereInput?.addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && (event.code === 'Space' || event.key === ' ')) {
+        event.preventDefault();
+        requestCompletion();
+        return;
+      }
+      if (!completionList.hidden) {
+        if (event.key === 'ArrowDown') {
           event.preventDefault();
-          reload({ page: 0 });
+          setCompletionSelection(completionState.selectedIndex + 1);
+          return;
         }
-      });
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          setCompletionSelection(completionState.selectedIndex - 1);
+          return;
+        }
+        if (event.key === 'Enter' || event.key === 'Tab') {
+          event.preventDefault();
+          acceptCompletion();
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          hideCompletion();
+          return;
+        }
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        hideCompletion();
+        reload({ page: 0 });
+      }
     });
     document.addEventListener('click', (event) => {
       const sort = event.target?.closest?.('[data-sort-column]');
       if (sort) {
         const column = sort.dataset.sortColumn;
-        const direction = state.sortColumn === column && state.sortDirection === 'asc' ? 'desc' : 'asc';
-        reload({ page: 0, sortColumn: column, sortDirection: direction });
+        if (state.sortColumn !== column) {
+          reload({ page: 0, sortColumn: column, sortDirection: 'asc' });
+        } else if (state.sortDirection === 'asc') {
+          reload({ page: 0, sortColumn: column, sortDirection: 'desc' });
+        } else {
+          reload({ page: 0, sortColumn: '', sortDirection: 'asc' });
+        }
         return;
       }
 
@@ -5764,6 +5952,192 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
         });
       }
     });
+    document.addEventListener('click', (event) => {
+      if (event.target !== whereInput && !completionList.contains(event.target)) {
+        hideCompletion();
+      }
+    });
+    window.addEventListener('resize', positionCompletionList);
+    window.addEventListener('message', (event) => {
+      const message = event.data || {};
+      if (message.type === 'completion') {
+        showCompletion(message);
+      }
+    });
+
+    function requestCompletion() {
+      window.clearTimeout(completionTimer);
+      sendCompletionRequest(++completionRequestId);
+    }
+
+    function requestCompletionSoon() {
+      const requestId = ++completionRequestId;
+      window.clearTimeout(completionTimer);
+      completionTimer = window.setTimeout(() => sendCompletionRequest(requestId), 120);
+    }
+
+    function sendCompletionRequest(requestId) {
+      vscode.postMessage({
+        command: 'completion',
+        where: whereInput?.value || '',
+        offset: whereInput?.selectionStart || 0,
+        requestId
+      });
+    }
+
+    function hideCompletion() {
+      window.clearTimeout(completionTimer);
+      completionList.hidden = true;
+      completionList.innerHTML = '';
+      completionState = {
+        ...completionState,
+        items: []
+      };
+    }
+
+    function showCompletion(message) {
+      if (message.requestId !== completionRequestId) {
+        return;
+      }
+
+      const items = Array.isArray(message.items) ? message.items : [];
+      if (!items.length) {
+        hideCompletion();
+        return;
+      }
+
+      completionState = {
+        items,
+        selectedIndex: 0,
+        replaceStart: Number.isInteger(message.replaceStart) ? message.replaceStart : whereInput.selectionStart,
+        replaceEnd: Number.isInteger(message.replaceEnd) ? message.replaceEnd : whereInput.selectionEnd
+      };
+      completionList.innerHTML = '';
+      items.forEach((item, index) => completionList.appendChild(renderCompletionItem(item, index)));
+      completionList.hidden = false;
+      setCompletionSelection(0);
+      positionCompletionList();
+    }
+
+    function renderCompletionItem(item, index) {
+      const row = document.createElement('div');
+      row.className = 'completion-item';
+      row.setAttribute('role', 'option');
+      row.dataset.index = String(index);
+
+      const kind = document.createElement('div');
+      kind.className = 'completion-kind';
+      kind.textContent = completionKindLabel(item.kind);
+
+      const main = document.createElement('div');
+      main.className = 'completion-main';
+
+      const label = document.createElement('div');
+      label.className = 'completion-label';
+      label.textContent = item.label || item.insertText || '';
+
+      const detail = document.createElement('div');
+      detail.className = 'completion-detail';
+      detail.textContent = item.detail || item.documentation || '';
+
+      main.appendChild(label);
+      if (detail.textContent) {
+        main.appendChild(detail);
+      }
+      row.appendChild(kind);
+      row.appendChild(main);
+      row.addEventListener('mousemove', () => setCompletionSelection(index));
+      row.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        acceptCompletion(index);
+      });
+      return row;
+    }
+
+    function completionKindLabel(kind) {
+      return {
+        alias: 'alias',
+        column: 'field',
+        table: 'table',
+        view: 'view'
+      }[kind] || 'item';
+    }
+
+    function setCompletionSelection(index) {
+      if (!completionState.items.length) {
+        return;
+      }
+      const length = completionState.items.length;
+      completionState.selectedIndex = ((index % length) + length) % length;
+      [...completionList.querySelectorAll('.completion-item')].forEach((row, rowIndex) => {
+        const active = rowIndex === completionState.selectedIndex;
+        row.classList.toggle('active', active);
+        row.setAttribute('aria-selected', active ? 'true' : 'false');
+        if (active) {
+          row.scrollIntoView({ block: 'nearest' });
+        }
+      });
+    }
+
+    function acceptCompletion(index = completionState.selectedIndex) {
+      const item = completionState.items[index];
+      if (!item || !whereInput) {
+        return;
+      }
+      const insertText = item.insertText || item.label || '';
+      whereInput.focus();
+      whereInput.setRangeText(insertText, completionState.replaceStart, completionState.replaceEnd, 'end');
+      hideCompletion();
+    }
+
+    function positionCompletionList() {
+      if (completionList.hidden || !whereInput) {
+        return;
+      }
+      const point = caretPoint(whereInput);
+      const width = Math.min(560, Math.max(260, completionList.offsetWidth || 260));
+      const height = Math.min(260, completionList.scrollHeight || 180);
+      const left = Math.min(Math.max(8, point.left), Math.max(8, window.innerWidth - width - 8));
+      const top = point.top + height + 8 > window.innerHeight
+        ? Math.max(8, point.top - height - 24)
+        : point.top;
+      completionList.style.left = left + 'px';
+      completionList.style.top = top + 'px';
+    }
+
+    function caretPoint(input) {
+      const style = window.getComputedStyle(input);
+      const mirror = document.createElement('div');
+      const properties = [
+        'boxSizing', 'width', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth',
+        'borderLeftWidth', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+        'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'textTransform',
+        'wordSpacing', 'textIndent', 'lineHeight'
+      ];
+      properties.forEach((property) => {
+        mirror.style[property] = style[property];
+      });
+      mirror.style.position = 'absolute';
+      mirror.style.visibility = 'hidden';
+      mirror.style.whiteSpace = 'pre';
+      mirror.style.top = '0';
+      mirror.style.left = '-9999px';
+      mirror.textContent = input.value.slice(0, input.selectionStart);
+
+      const marker = document.createElement('span');
+      marker.textContent = String.fromCharCode(8203);
+      mirror.appendChild(marker);
+      document.body.appendChild(mirror);
+
+      const rect = input.getBoundingClientRect();
+      const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.45 || 20;
+      const point = {
+        left: rect.left + marker.offsetLeft - input.scrollLeft,
+        top: rect.top + marker.offsetTop - input.scrollTop + lineHeight
+      };
+      mirror.remove();
+      return point;
+    }
   </script>
 </body>
 </html>`;
@@ -5784,9 +6158,6 @@ function renderTableDataGrid(columns, rows, state, loading, error) {
   }
 
   const head = columns.map((column) => renderTableDataHeader(column, state)).join('');
-  const filters = columns.map((column) => (
-    `<th><input class="filter-input" data-filter-column="${escapeHtml(column.name)}" value="${escapeHtml(state.filters[column.name] || '')}" autocomplete="off"></th>`
-  )).join('');
   const body = rows.length
     ? rows.map((row, rowIndex) => renderTableDataRow(row, columns, rowIndex)).join('')
     : `<tr><td class="empty" colspan="${columns.length + 1}">No rows match the current view.</td></tr>`;
@@ -5797,10 +6168,6 @@ function renderTableDataGrid(columns, rows, state, loading, error) {
         <th class="row-action">Row</th>
         ${head}
       </tr>
-      <tr class="filters">
-        <th class="row-action"></th>
-        ${filters}
-      </tr>
     </thead>
     <tbody>${body}</tbody>
   </table>`;
@@ -5808,14 +6175,42 @@ function renderTableDataGrid(columns, rows, state, loading, error) {
 
 function renderTableDataHeader(column, state) {
   const isSorted = state.sortColumn === column.name;
-  const sortLabel = isSorted ? (state.sortDirection === 'desc' ? 'Desc' : 'Asc') : 'Sort';
+  const sortState = isSorted ? state.sortDirection : 'none';
+  const sortLabel = dataViewSortButtonLabel(column.name, sortState);
+  const copyLabel = `Copy ${column.name} values from current page.`;
   return `<th>
     <div class="column-head">
       <span class="column-name" title="${escapeHtml(column.name)}">${escapeHtml(column.name)}</span>
-      <button class="mini-button" type="button" data-sort-column="${escapeHtml(column.name)}">${sortLabel}</button>
-      <button class="mini-button" type="button" data-copy-column="${escapeHtml(column.name)}">Copy</button>
+      <button class="mini-button sort-button${isSorted ? ' active' : ''}" type="button" data-sort-column="${escapeHtml(column.name)}" title="${escapeHtml(sortLabel)}" aria-label="${escapeHtml(sortLabel)}">${renderDataViewSortIcon(sortState)}</button>
+      <button class="mini-button icon-button" type="button" data-copy-column="${escapeHtml(column.name)}" title="${escapeHtml(copyLabel)}" aria-label="${escapeHtml(copyLabel)}">${renderCopyIcon()}</button>
     </div>
   </th>`;
+}
+
+function renderDataViewSortIcon(sortState) {
+  const icon = sortState === 'asc'
+    ? '&#8593;'
+    : sortState === 'desc'
+      ? '&#8595;'
+      : '&#8597;';
+  return `<span class="sort-icon" aria-hidden="true">${icon}</span>`;
+}
+
+function dataViewSortButtonLabel(columnName, sortState) {
+  if (sortState === 'asc') {
+    return `Sorted ascending by ${columnName}. Click to sort descending.`;
+  }
+  if (sortState === 'desc') {
+    return `Sorted descending by ${columnName}. Click to remove sort.`;
+  }
+  return `Sort ${columnName} ascending.`;
+}
+
+function renderCopyIcon() {
+  return `<svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+    <path d="M5 5.5a1.5 1.5 0 0 1 1.5-1.5h5A1.5 1.5 0 0 1 13 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-5A1.5 1.5 0 0 1 5 12.5v-7Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+    <path d="M3 10.5h-.5A1.5 1.5 0 0 1 1 9V3.5A1.5 1.5 0 0 1 2.5 2H8a1.5 1.5 0 0 1 1.5 1.5V4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
 }
 
 function renderTableDataRow(row, columns, rowIndex) {
@@ -5827,7 +6222,7 @@ function renderTableDataRow(row, columns, rowIndex) {
   }).join('');
 
   return `<tr>
-    <th class="row-action"><button class="mini-button" type="button" data-copy-row="${rowIndex}">Copy</button></th>
+    <th class="row-action"><button class="mini-button icon-button" type="button" data-copy-row="${rowIndex}" title="Copy row" aria-label="Copy row ${rowIndex + 1}">${renderCopyIcon()}</button></th>
     ${cells}
   </tr>`;
 }
