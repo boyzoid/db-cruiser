@@ -9,7 +9,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 - Save, edit, test, and remove MySQL connections from the DB Cruiser activity bar view.
 - Connect directly or through an SSH tunnel using password or private key authentication.
 - Add connection colors so tabs, tree items, consoles, and result views are easy to tell apart.
-- Manage MySQL users from a saved connection, including `user@host` accounts, passwords, global or schema-level privileges, and `WITH GRANT OPTION`.
+- Manage MySQL users from a saved connection, including `user@host` accounts, passwords, global or schema-level privileges with inline explanations, and `WITH GRANT OPTION`.
 
 ### Schema Explorer
 
@@ -23,6 +23,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 
 - Open a console for any saved connection or schema.
 - Choose the active schema and row limit from the console toolbar.
+- Use schema-aware completions for query and DDL work, including `ALTER TABLE`, column changes, indexes, and foreign-key references.
 - Run selected SQL or the whole editor with `Cmd+Enter` on macOS or `Ctrl+Enter` elsewhere.
 - Export query results as CSV, JSON, or Markdown.
 - Run MySQL `EXPLAIN` for a statement and inspect visual plan steps, risk cues, and raw plan details.
@@ -49,7 +50,11 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 - A MySQL-compatible database.
 - Network access from VS Code to the database server, or to an SSH server that can reach the database.
 - Database credentials with permission to inspect metadata and run the queries you choose.
-- User management requires MySQL privileges to inspect accounts and run user/privilege statements such as `CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`, and `REVOKE`.
+- User management requires an administrative MySQL account that can inspect `mysql.user`, view grants for managed accounts, and run account/privilege statements such as `CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`, and `REVOKE`.
+
+## User Management Safety
+
+User management changes are applied directly to MySQL. Use this feature cautiously, preferably with an administrative account intended for database administration, because changing users or privileges can lock people out, interrupt applications, or grant broader access than intended. Review the selected `user@host`, scope, and privileges before saving, and be especially careful with global privileges and `WITH GRANT OPTION`.
 
 ## Extension Settings
 

@@ -31,41 +31,53 @@ const CONNECTION_COLORS = [
 ];
 const CONNECTION_COLOR_IDS = new Set(CONNECTION_COLORS.map((color) => color.id));
 const USER_PRIVILEGE_OPTIONS = [
-  { id: 'SELECT', label: 'Select' },
-  { id: 'INSERT', label: 'Insert' },
-  { id: 'UPDATE', label: 'Update' },
-  { id: 'DELETE', label: 'Delete' },
-  { id: 'CREATE', label: 'Create' },
-  { id: 'DROP', label: 'Drop' },
-  { id: 'ALTER', label: 'Alter' },
-  { id: 'INDEX', label: 'Index' },
-  { id: 'REFERENCES', label: 'References' },
-  { id: 'CREATE TEMPORARY TABLES', label: 'Temporary Tables' },
-  { id: 'LOCK TABLES', label: 'Lock Tables' },
-  { id: 'EXECUTE', label: 'Execute' },
-  { id: 'CREATE VIEW', label: 'Create View' },
-  { id: 'SHOW VIEW', label: 'Show View' },
-  { id: 'CREATE ROUTINE', label: 'Create Routine' },
-  { id: 'ALTER ROUTINE', label: 'Alter Routine' },
-  { id: 'EVENT', label: 'Event' },
-  { id: 'TRIGGER', label: 'Trigger' },
-  { id: 'CREATE USER', label: 'Create User', globalOnly: true },
-  { id: 'FILE', label: 'File', globalOnly: true },
-  { id: 'PROCESS', label: 'Process', globalOnly: true },
-  { id: 'RELOAD', label: 'Reload', globalOnly: true },
-  { id: 'REPLICATION CLIENT', label: 'Replication Client', globalOnly: true },
-  { id: 'REPLICATION SLAVE', label: 'Replication Slave', globalOnly: true },
-  { id: 'SHOW DATABASES', label: 'Show Databases', globalOnly: true },
-  { id: 'SHUTDOWN', label: 'Shutdown', globalOnly: true }
+  { id: 'SELECT', label: 'Select', description: 'Read rows and table/view data in the selected scope.' },
+  { id: 'INSERT', label: 'Insert', description: 'Add new rows to tables in the selected scope.' },
+  { id: 'UPDATE', label: 'Update', description: 'Change existing rows in tables in the selected scope.' },
+  { id: 'DELETE', label: 'Delete', description: 'Remove rows from tables in the selected scope.' },
+  { id: 'CREATE', label: 'Create', description: 'Create new databases or tables in the selected scope.' },
+  { id: 'DROP', label: 'Drop', description: 'Drop databases, tables, or views in the selected scope.' },
+  { id: 'ALTER', label: 'Alter', description: 'Change table structure, such as columns, indexes, and table options.' },
+  { id: 'INDEX', label: 'Index', description: 'Create or drop indexes on tables in the selected scope.' },
+  { id: 'REFERENCES', label: 'References', description: 'Create foreign keys that reference tables in the selected scope.' },
+  { id: 'CREATE TEMPORARY TABLES', label: 'Temporary Tables', description: 'Create session-only TEMPORARY tables in the selected scope.' },
+  { id: 'LOCK TABLES', label: 'Lock Tables', description: 'Use LOCK TABLES on tables in the selected scope.' },
+  { id: 'EXECUTE', label: 'Execute', description: 'Run stored procedures and stored functions in the selected scope.' },
+  { id: 'CREATE VIEW', label: 'Create View', description: 'Create views in the selected scope.' },
+  { id: 'SHOW VIEW', label: 'Show View', description: 'View the SQL definition behind views in the selected scope.' },
+  { id: 'CREATE ROUTINE', label: 'Create Routine', description: 'Create stored procedures and stored functions in the selected scope.' },
+  { id: 'ALTER ROUTINE', label: 'Alter Routine', description: 'Change or drop stored procedures and stored functions in the selected scope.' },
+  { id: 'EVENT', label: 'Event', description: 'Create, alter, drop, or run scheduled events in the selected scope.' },
+  { id: 'TRIGGER', label: 'Trigger', description: 'Create, drop, or execute triggers in the selected scope.' },
+  { id: 'CREATE USER', label: 'Create User', description: 'Create, alter, drop, rename, and revoke access from MySQL accounts.', globalOnly: true },
+  { id: 'FILE', label: 'File', description: 'Read and write files on the database server host with statements such as LOAD DATA and SELECT INTO OUTFILE.', globalOnly: true },
+  { id: 'PROCESS', label: 'Process', description: 'See information about threads and statements running for other sessions.', globalOnly: true },
+  { id: 'RELOAD', label: 'Reload', description: 'Run administrative reload and flush operations for caches, logs, and privileges.', globalOnly: true },
+  { id: 'REPLICATION CLIENT', label: 'Replication Client', description: 'Inspect replication status and binary log metadata.', globalOnly: true },
+  { id: 'REPLICATION SLAVE', label: 'Replication Slave', description: 'Connect as a replica and read binary log updates from the source server.', globalOnly: true },
+  { id: 'SHOW DATABASES', label: 'Show Databases', description: 'See database names even without direct privileges on every database.', globalOnly: true },
+  { id: 'SHUTDOWN', label: 'Shutdown', description: 'Shut down the MySQL server.', globalOnly: true }
 ];
 const USER_PRIVILEGE_IDS = new Set(USER_PRIVILEGE_OPTIONS.map((privilege) => privilege.id));
 const USER_PRIVILEGE_ORDER = new Map(USER_PRIVILEGE_OPTIONS.map((privilege, index) => [privilege.id, index]));
+const MYSQL_SYSTEM_ACCOUNT_KEYS = new Set([
+  'mysql.sys@localhost',
+  'mysql.session@localhost',
+  'mysql.infoschema@localhost',
+  'mysqlxsys@localhost',
+  'mariadb-sys@localhost',
+  'mariadb.sys@localhost'
+]);
 const SQL_RESERVED_WORDS = new Set([
-  'add', 'all', 'alter', 'and', 'as', 'asc', 'between', 'by', 'case', 'create', 'cross',
-  'delete', 'desc', 'distinct', 'drop', 'else', 'end', 'exists', 'from', 'full', 'group',
-  'having', 'in', 'inner', 'insert', 'into', 'is', 'join', 'left', 'like', 'limit',
-  'not', 'null', 'on', 'or', 'order', 'outer', 'right', 'select', 'set', 'then',
-  'union', 'update', 'values', 'when', 'where'
+  'add', 'algorithm', 'all', 'alter', 'and', 'as', 'asc', 'auto_increment', 'between',
+  'by', 'case', 'change', 'column', 'constraint', 'create', 'cross', 'database',
+  'default', 'delete', 'desc', 'distinct', 'drop', 'else', 'end', 'exists', 'foreign',
+  'from', 'full', 'function', 'group', 'having', 'if', 'in', 'index', 'inner',
+  'insert', 'into', 'is', 'join', 'key', 'left', 'like', 'limit', 'modify', 'not',
+  'null', 'on', 'or', 'order', 'outer', 'primary', 'procedure', 'references',
+  'rename', 'right', 'schema', 'select', 'set', 'table', 'temporary', 'then', 'to',
+  'trigger', 'truncate', 'union', 'unique', 'update', 'values', 'view', 'when',
+  'where'
 ]);
 
 /**
@@ -81,7 +93,7 @@ function activate(context) {
   const userManagementView = new UserManagementView(mysql, context.extensionUri);
   const sqlCompletionCache = new SqlCompletionMetadataCache(mysql);
   const sqlCompletionProvider = new SqlCompletionProvider(store, consoleSessions, sqlCompletionCache);
-  const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions, sqlCompletionCache, context.extensionUri);
+  const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions, sqlCompletionCache, provider, context.extensionUri);
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   status.command = 'dbCruiser.selectSchema';
 
@@ -110,7 +122,7 @@ function activate(context) {
       await openSqlConsole(node, store, consoleSessions, sqlConsoleView);
       updateStatus();
     }),
-    vscode.commands.registerCommand('dbCruiser.runQuery', () => runQuery(store, consoleSessions, mysql, resultView, provider)),
+    vscode.commands.registerCommand('dbCruiser.runQuery', () => runQuery(store, consoleSessions, mysql, resultView, provider, sqlCompletionCache)),
     vscode.commands.registerCommand('dbCruiser.explainQuery', () => explainQuery(store, consoleSessions, mysql, resultView)),
     vscode.commands.registerCommand('dbCruiser.selectSchema', async () => {
       await selectSchemaForActiveConsole(store, consoleSessions, mysql);
@@ -816,12 +828,14 @@ class MySqlAdapter {
     const grants = rows
       .map((row) => Object.values(row || {}).find((value) => typeof value === 'string'))
       .filter(Boolean);
+    const systemAccount = isMysqlSystemAccount({ user, host });
 
     return {
       user: String(user || ''),
       host: String(host || ''),
       grants,
-      privileges: parseUserGrantStatements(grants)
+      privileges: parseUserGrantStatements(grants),
+      systemAccount
     };
   }
 
@@ -896,6 +910,10 @@ class MySqlAdapter {
   async dropUser(connection, user, host) {
     const client = await this.connect(connection, undefined, { database: undefined });
     try {
+      const details = await this.userDetailsWithClient(client, user, host);
+      if (details.systemAccount) {
+        throw new Error(`${formatUserAccount({ user, host })} is a MySQL system account and cannot be dropped from DB Cruiser.`);
+      }
       await client.query(`drop user ${mysqlAccountSql(client, user, host)}`);
     } finally {
       await client.end();
@@ -1455,10 +1473,16 @@ class UserManagementView {
             this.mysql.users(view.connection)
           ]);
           const selected = pickSelectedManagedUser(users, view.selected);
-          view.selected = selected;
           const details = selected
             ? await this.mysql.userDetails(view.connection, selected.user, selected.host)
             : undefined;
+          view.selected = details
+            ? {
+                user: details.user,
+                host: details.host,
+                systemAccount: details.systemAccount
+              }
+            : selected;
           view.panel.webview.html = renderUserManagementHtml({
             connection: view.connection,
             schemas,
@@ -1479,6 +1503,22 @@ class UserManagementView {
   }
 
   async save(view, values) {
+    const originalAccount = {
+      user: values?.originalUser,
+      host: values?.originalHost
+    };
+    if (values?.mode === 'edit' && (view.selected?.systemAccount || isMysqlSystemAccount(originalAccount))) {
+      const answer = await vscode.window.showWarningMessage(
+        `Edit MySQL system account ${formatUserAccount(originalAccount)}? Changes can break MySQL internal features.`,
+        { modal: true },
+        'Edit Anyway'
+      );
+      if (answer !== 'Edit Anyway') {
+        await this.postStatus(view, '', 'Edit canceled.');
+        return;
+      }
+    }
+
     await this.postStatus(view, 'busy', 'Saving user...');
     try {
       const details = await this.mysql.saveUser(view.connection, values);
@@ -1498,6 +1538,11 @@ class UserManagementView {
 
   async delete(view, user, host) {
     const account = formatUserAccount({ user, host });
+    if (view.selected?.systemAccount || isMysqlSystemAccount({ user, host })) {
+      await this.postStatus(view, 'error', `${account} is a MySQL system account and cannot be dropped from DB Cruiser.`);
+      return;
+    }
+
     const answer = await vscode.window.showWarningMessage(
       `Drop MySQL user ${account}? This cannot be undone by DB Cruiser.`,
       { modal: true },
@@ -1536,11 +1581,13 @@ class SqlConsoleView {
    * @param {MySqlAdapter} mysql
    * @param {ConsoleSessionStore} consoleSessions
    * @param {SqlCompletionMetadataCache} completionMetadataCache
+   * @param {DatabaseTreeProvider} treeProvider
    */
-  constructor(mysql, consoleSessions, completionMetadataCache, extensionUri) {
+  constructor(mysql, consoleSessions, completionMetadataCache, treeProvider, extensionUri) {
     this.mysql = mysql;
     this.consoleSessions = consoleSessions;
     this.completionMetadataCache = completionMetadataCache;
+    this.treeProvider = treeProvider;
     this.extensionUri = extensionUri;
     this.panels = new Map();
     this.panelResults = new WeakMap();
@@ -1712,6 +1759,7 @@ class SqlConsoleView {
       const started = Date.now();
       const resultSets = await this.mysql.query(connection, appendLimitHint(sql, rowLimit), schema || connection.database);
       const elapsedMs = Date.now() - started;
+      const schemaChanged = hasSchemaChangingSql(sql);
       const result = {
         kind: 'query',
         connection,
@@ -1721,10 +1769,13 @@ class SqlConsoleView {
         resultSets
       };
       this.panelResults.set(panel, result);
+      if (schemaChanged) {
+        refreshSchemaAfterChange(connection, result.schema, this.completionMetadataCache, this.treeProvider);
+      }
       await panel.webview.postMessage({
         type: 'results',
         state: 'success',
-        message: `Completed in ${elapsedMs} ms.`,
+        message: schemaChanged ? `Completed in ${elapsedMs} ms. Schema refreshed.` : `Completed in ${elapsedMs} ms.`,
         html: renderQueryResults(result)
       });
     } catch (error) {
@@ -1801,6 +1852,24 @@ class SqlCompletionMetadataCache {
       promise
     });
     return promise;
+  }
+
+  invalidate(connection, schema) {
+    if (!connection?.id) {
+      return;
+    }
+
+    if (schema) {
+      this.entries.delete(`${connection.id}:${schema}`);
+      return;
+    }
+
+    const prefix = `${connection.id}:`;
+    for (const key of Array.from(this.entries.keys())) {
+      if (key.startsWith(prefix)) {
+        this.entries.delete(key);
+      }
+    }
   }
 }
 
@@ -2150,7 +2219,7 @@ async function openSqlConsole(node, store, consoleSessions, sqlConsoleView) {
   await sqlConsoleView.open(connection, schema);
 }
 
-async function runQuery(store, consoleSessions, mysql, resultView, provider) {
+async function runQuery(store, consoleSessions, mysql, resultView, provider, completionMetadataCache) {
   const editor = vscode.window.activeTextEditor;
   if (!editor || editor.document.languageId !== 'sql') {
     vscode.window.showInformationMessage('Open a SQL editor before running a query.');
@@ -2191,7 +2260,11 @@ async function runQuery(store, consoleSessions, mysql, resultView, provider) {
           elapsedMs: Date.now() - started,
           resultSets
         });
-        provider.refresh();
+        if (hasSchemaChangingSql(sql)) {
+          refreshSchemaAfterChange(connection, schema, completionMetadataCache, provider);
+        } else {
+          provider.refresh();
+        }
       } catch (error) {
         vscode.window.showErrorMessage(errorMessage(error));
       }
@@ -2635,6 +2708,16 @@ function formatUserAccount(account) {
   return `${user || '(anonymous)'}@${host || '(no host)'}`;
 }
 
+function isMysqlSystemAccount(account) {
+  return MYSQL_SYSTEM_ACCOUNT_KEYS.has(mysqlSystemAccountKey(account));
+}
+
+function mysqlSystemAccountKey(account) {
+  const user = String(account?.user || '').toLowerCase();
+  const host = String(account?.host || '').toLowerCase();
+  return `${user}@${host}`;
+}
+
 function normalizeManagedUserPayload(values = {}) {
   const mode = values.mode === 'edit' ? 'edit' : 'add';
   const user = String(values.user || '').trim();
@@ -2988,6 +3071,53 @@ function hasRunnableSql(sql) {
     .replace(/--[^\r\n]*/g, '')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .trim().length > 0;
+}
+
+function hasSchemaChangingSql(sql) {
+  return splitSqlStatements(sql).some(isSchemaChangingStatement);
+}
+
+function splitSqlStatements(sql) {
+  const text = String(sql || '');
+  const masked = maskSqlLiteralsAndComments(text);
+  const statements = [];
+  let start = 0;
+
+  for (let index = 0; index < masked.length; index += 1) {
+    if (masked[index] !== ';') {
+      continue;
+    }
+    const statement = text.slice(start, index);
+    if (hasRunnableSql(statement)) {
+      statements.push(statement);
+    }
+    start = index + 1;
+  }
+
+  const trailing = text.slice(start);
+  if (hasRunnableSql(trailing)) {
+    statements.push(trailing);
+  }
+  return statements;
+}
+
+function isSchemaChangingStatement(statement) {
+  const sql = stripLeadingSqlComments(statement).trim();
+  if (!sql) {
+    return false;
+  }
+
+  const normalized = maskSqlLiteralsAndComments(sql).replace(/\s+/g, ' ').trim();
+  return /^(?:create|alter|drop)\s+(?:or\s+replace\s+)?(?:temporary\s+)?(?:database|schema|table|view|trigger|procedure|function|event)\b/i.test(normalized)
+    || /^create\s+(?:unique\s+|fulltext\s+|spatial\s+)?index\b/i.test(normalized)
+    || /^drop\s+index\b/i.test(normalized)
+    || /^rename\s+table\b/i.test(normalized)
+    || /^truncate\s+(?:table\s+)?/i.test(normalized);
+}
+
+function refreshSchemaAfterChange(connection, schema, completionMetadataCache, provider) {
+  completionMetadataCache?.invalidate(connection);
+  provider?.refresh();
 }
 
 function prepareExplainStatement(sql) {
@@ -3502,12 +3632,115 @@ function emptyCompletionMetadata(schema) {
   };
 }
 
+const SQL_SCHEMA_STATEMENT_COMPLETIONS = [
+  schemaCompletion('create', 'Create a schema object', 'create '),
+  schemaCompletion('alter', 'Alter a schema object', 'alter '),
+  schemaCompletion('drop', 'Drop a schema object', 'drop '),
+  schemaCompletion('rename', 'Rename a table', 'rename table '),
+  schemaCompletion('truncate', 'Truncate a table', 'truncate table ')
+];
+
+const SQL_CREATE_OBJECT_COMPLETIONS = [
+  schemaCompletion('table', 'Create a table', 'table '),
+  schemaCompletion('table if not exists', 'Create a table only when missing', 'table if not exists '),
+  schemaCompletion('view', 'Create a view', 'view '),
+  schemaCompletion('or replace view', 'Create or replace a view', 'or replace view '),
+  schemaCompletion('index', 'Create an index', 'index '),
+  schemaCompletion('unique index', 'Create a unique index', 'unique index '),
+  schemaCompletion('schema', 'Create a schema', 'schema '),
+  schemaCompletion('database', 'Create a database', 'database ')
+];
+
+const SQL_ALTER_OBJECT_COMPLETIONS = [
+  schemaCompletion('table', 'Alter a table', 'table '),
+  schemaCompletion('view', 'Alter a view', 'view '),
+  schemaCompletion('schema', 'Alter a schema', 'schema '),
+  schemaCompletion('database', 'Alter a database', 'database ')
+];
+
+const SQL_DROP_OBJECT_COMPLETIONS = [
+  schemaCompletion('table', 'Drop a table', 'table '),
+  schemaCompletion('table if exists', 'Drop a table only when present', 'table if exists '),
+  schemaCompletion('view', 'Drop a view', 'view '),
+  schemaCompletion('view if exists', 'Drop a view only when present', 'view if exists '),
+  schemaCompletion('index', 'Drop an index', 'index '),
+  schemaCompletion('schema', 'Drop a schema', 'schema '),
+  schemaCompletion('database', 'Drop a database', 'database ')
+];
+
+const SQL_ALTER_TABLE_ACTION_COMPLETIONS = [
+  schemaCompletion('add', 'Add a column, index, or constraint', 'add '),
+  schemaCompletion('drop', 'Drop a column, index, or constraint', 'drop '),
+  schemaCompletion('modify', 'Modify a column definition', 'modify column '),
+  schemaCompletion('change', 'Change a column definition and name', 'change column '),
+  schemaCompletion('rename', 'Rename a table or column', 'rename '),
+  schemaCompletion('alter', 'Alter a column default', 'alter column ')
+];
+
+const SQL_ALTER_TABLE_ADD_COMPLETIONS = [
+  schemaCompletion('column', 'Add a column', 'column '),
+  schemaCompletion('index', 'Add an index', 'index '),
+  schemaCompletion('key', 'Add a key', 'key '),
+  schemaCompletion('unique', 'Add a unique index', 'unique '),
+  schemaCompletion('primary key', 'Add a primary key', 'primary key '),
+  schemaCompletion('constraint', 'Add a named constraint', 'constraint '),
+  schemaCompletion('foreign key', 'Add a foreign key', 'foreign key ')
+];
+
+const SQL_ALTER_TABLE_DROP_COMPLETIONS = [
+  schemaCompletion('column', 'Drop a column', 'column '),
+  schemaCompletion('index', 'Drop an index', 'index '),
+  schemaCompletion('key', 'Drop a key', 'key '),
+  schemaCompletion('primary key', 'Drop the primary key', 'primary key'),
+  schemaCompletion('foreign key', 'Drop a foreign key', 'foreign key '),
+  schemaCompletion('constraint', 'Drop a constraint', 'constraint ')
+];
+
+const SQL_ALTER_TABLE_RENAME_COMPLETIONS = [
+  schemaCompletion('column', 'Rename a column', 'column '),
+  schemaCompletion('to', 'Rename the table', 'to ')
+];
+
+const SQL_COLUMN_DEFINITION_COMPLETIONS = [
+  schemaCompletion('int', 'Integer column type', 'int', 'type'),
+  schemaCompletion('bigint', 'Large integer column type', 'bigint', 'type'),
+  schemaCompletion('decimal(10,2)', 'Fixed-point decimal column type', 'decimal(10,2)', 'type'),
+  schemaCompletion('varchar(255)', 'Variable-length string column type', 'varchar(255)', 'type'),
+  schemaCompletion('text', 'Text column type', 'text', 'type'),
+  schemaCompletion('longtext', 'Long text column type', 'longtext', 'type'),
+  schemaCompletion('datetime', 'Date and time column type', 'datetime', 'type'),
+  schemaCompletion('timestamp', 'Timestamp column type', 'timestamp', 'type'),
+  schemaCompletion('date', 'Date column type', 'date', 'type'),
+  schemaCompletion('json', 'JSON column type', 'json', 'type'),
+  schemaCompletion('boolean', 'Boolean column type', 'boolean', 'type'),
+  schemaCompletion('not null', 'Require a value', 'not null ', 'keyword'),
+  schemaCompletion('null', 'Allow NULL values', 'null ', 'keyword'),
+  schemaCompletion('default', 'Set a default value', 'default ', 'keyword'),
+  schemaCompletion('auto_increment', 'Auto-increment integer values', 'auto_increment', 'keyword'),
+  schemaCompletion('primary key', 'Mark as primary key', 'primary key', 'keyword'),
+  schemaCompletion('unique', 'Require unique values', 'unique', 'keyword'),
+  schemaCompletion('references', 'Reference another table', 'references ', 'keyword')
+];
+
+function schemaCompletion(label, detail, insertText, kind = 'keyword') {
+  const sortGroup = kind === 'type' ? '0' : '1';
+  return {
+    label,
+    detail,
+    insertText,
+    kind,
+    filterText: label,
+    sortText: `${sortGroup}:${label}`
+  };
+}
+
 function buildSqlCompletionList(document, position, sql, offset, metadata) {
   const statement = currentSqlStatement(sql, offset);
   const before = sql.slice(statement.start, offset);
   const range = completionWordRange(document, position);
   const references = extractTableReferences(statement.text, metadata);
   const memberContext = getMemberCompletionContext(before);
+  const ddlColumnContext = getDdlColumnCompletionContext(before, metadata);
 
   if (memberContext) {
     const object = objectForQualifier(memberContext.qualifier, references, metadata);
@@ -3516,11 +3749,16 @@ function buildSqlCompletionList(document, position, sql, offset, metadata) {
     }
   }
 
+  if (ddlColumnContext?.object) {
+    return completionList(columnCompletionItems(ddlColumnContext.object, range));
+  }
+
   if (isTableCompletionContext(before)) {
     return completionList(tableCompletionItems(metadata, range));
   }
 
   return completionList([
+    ...schemaKeywordCompletionItems(before, range),
     ...aliasCompletionItems(references, range),
     ...referenceColumnCompletionItems(references, range)
   ]);
@@ -3533,6 +3771,7 @@ function buildSqlCompletionSuggestions(sql, offset, metadata) {
   const replacement = completionTextRange(sql, safeOffset);
   const references = extractTableReferences(statement.text, metadata);
   const memberContext = getMemberCompletionContext(before);
+  const ddlColumnContext = getDdlColumnCompletionContext(before, metadata);
   let items = [];
 
   if (memberContext) {
@@ -3540,10 +3779,13 @@ function buildSqlCompletionSuggestions(sql, offset, metadata) {
     if (object) {
       items = columnCompletionSuggestions(object);
     }
+  } else if (ddlColumnContext?.object) {
+    items = columnCompletionSuggestions(ddlColumnContext.object);
   } else if (isTableCompletionContext(before)) {
     items = tableCompletionSuggestions(metadata);
   } else {
     items = [
+      ...schemaKeywordCompletionSuggestions(before),
       ...aliasCompletionSuggestions(references),
       ...referenceColumnCompletionSuggestions(references)
     ];
@@ -3558,6 +3800,78 @@ function buildSqlCompletionSuggestions(sql, offset, metadata) {
 
 function completionList(items) {
   return items.length ? new vscode.CompletionList(items, false) : undefined;
+}
+
+function schemaKeywordCompletionItems(sqlBefore, range) {
+  return schemaKeywordCompletionDefinitions(sqlBefore).map((definition) => {
+    const item = new vscode.CompletionItem(definition.label, completionKindForSchemaDefinition(definition));
+    item.detail = definition.detail;
+    item.insertText = definition.insertText;
+    item.filterText = definition.filterText;
+    item.range = range;
+    item.sortText = `0:${definition.sortText}`;
+    return item;
+  });
+}
+
+function schemaKeywordCompletionSuggestions(sqlBefore) {
+  return schemaKeywordCompletionDefinitions(sqlBefore).map((definition) => ({
+    label: definition.label,
+    kind: definition.kind,
+    detail: definition.detail,
+    insertText: definition.insertText,
+    filterText: definition.filterText,
+    sortText: `0:${definition.sortText}`
+  }));
+}
+
+function completionKindForSchemaDefinition(definition) {
+  if (definition.kind === 'type') {
+    return vscode.CompletionItemKind.TypeParameter;
+  }
+  return vscode.CompletionItemKind.Keyword;
+}
+
+function schemaKeywordCompletionDefinitions(sqlBefore) {
+  const source = stripLeadingSqlComments(String(sqlBefore || ''));
+  const masked = maskSqlLiteralsAndComments(source);
+  const alterTail = alterTableTailForCompletion(masked);
+
+  if (alterTail !== undefined) {
+    if (/^\s*$/.test(alterTail)) {
+      return SQL_ALTER_TABLE_ACTION_COMPLETIONS;
+    }
+    if (/\badd\s+[A-Za-z_]*$/i.test(alterTail) || /\badd\s*$/i.test(alterTail)) {
+      return SQL_ALTER_TABLE_ADD_COMPLETIONS;
+    }
+    if (/\bdrop\s+[A-Za-z_]*$/i.test(alterTail) || /\bdrop\s*$/i.test(alterTail)) {
+      return SQL_ALTER_TABLE_DROP_COMPLETIONS;
+    }
+    if (/\brename\s+[A-Za-z_]*$/i.test(alterTail) || /\brename\s*$/i.test(alterTail)) {
+      return SQL_ALTER_TABLE_RENAME_COMPLETIONS;
+    }
+    if (isAlterColumnDefinitionCompletionContext(alterTail)) {
+      return SQL_COLUMN_DEFINITION_COMPLETIONS;
+    }
+  }
+
+  if (isCreateTableColumnDefinitionCompletionContext(masked)) {
+    return SQL_COLUMN_DEFINITION_COMPLETIONS;
+  }
+
+  if (/\bcreate\s+[A-Za-z_]*$/i.test(masked) || /\bcreate\s*$/i.test(masked)) {
+    return SQL_CREATE_OBJECT_COMPLETIONS;
+  }
+  if (/\balter\s+[A-Za-z_]*$/i.test(masked) || /\balter\s*$/i.test(masked)) {
+    return SQL_ALTER_OBJECT_COMPLETIONS;
+  }
+  if (/\bdrop\s+[A-Za-z_]*$/i.test(masked) || /\bdrop\s*$/i.test(masked)) {
+    return SQL_DROP_OBJECT_COMPLETIONS;
+  }
+
+  return isSchemaStatementStartCompletionContext(masked)
+    ? SQL_SCHEMA_STATEMENT_COMPLETIONS
+    : [];
 }
 
 function currentSqlStatement(sql, offset) {
@@ -3774,6 +4088,118 @@ function normalizeCompletionFilterText(value) {
   return unquoteIdentifier(String(value || '').replace(/^`/, '').replace(/`$/, '')).toLowerCase();
 }
 
+function getDdlColumnCompletionContext(sqlBefore, metadata) {
+  const referencedObject = referencedTableColumnCompletionObject(sqlBefore, metadata);
+  if (referencedObject) {
+    return { object: referencedObject };
+  }
+
+  const alterContext = alterTableColumnCompletionContext(sqlBefore, metadata);
+  if (alterContext?.object) {
+    return alterContext;
+  }
+
+  const indexObject = createIndexColumnCompletionObject(sqlBefore, metadata);
+  if (indexObject) {
+    return { object: indexObject };
+  }
+
+  return undefined;
+}
+
+function alterTableColumnCompletionContext(sqlBefore, metadata) {
+  const masked = maskSqlLiteralsAndComments(stripLeadingSqlComments(String(sqlBefore || '')));
+  const qualified = qualifiedSqlIdentifierPatternSource();
+  const match = masked.match(new RegExp(`\\balter\\s+table\\s+(?:if\\s+exists\\s+)?(${qualified})([\\s\\S]*)$`, 'i'));
+  if (!match) {
+    return undefined;
+  }
+
+  const object = objectForQualifiedName(match[1], metadata);
+  const tail = match[2] || '';
+  if (!object) {
+    return undefined;
+  }
+
+  if (isAlterColumnNameCompletionContext(tail) || isColumnListCompletionContext(tail)) {
+    return { object };
+  }
+
+  return undefined;
+}
+
+function referencedTableColumnCompletionObject(sqlBefore, metadata) {
+  const masked = maskSqlLiteralsAndComments(stripLeadingSqlComments(String(sqlBefore || '')));
+  const qualified = qualifiedSqlIdentifierPatternSource();
+  const match = masked.match(new RegExp(`\\breferences\\s+(${qualified})\\s*\\([^)]*$`, 'i'));
+  return match ? objectForQualifiedName(match[1], metadata) : undefined;
+}
+
+function createIndexColumnCompletionObject(sqlBefore, metadata) {
+  const masked = maskSqlLiteralsAndComments(stripLeadingSqlComments(String(sqlBefore || '')));
+  const identifier = sqlIdentifierPatternSource();
+  const qualified = qualifiedSqlIdentifierPatternSource();
+  const match = masked.match(new RegExp(`\\bcreate\\s+(?:unique\\s+|fulltext\\s+|spatial\\s+)?index\\s+${identifier}\\s+on\\s+(${qualified})\\s*\\([^)]*$`, 'i'));
+  return match ? objectForQualifiedName(match[1], metadata) : undefined;
+}
+
+function isAlterColumnNameCompletionContext(tail) {
+  const partial = '[\\w$`]*';
+  return new RegExp(`\\b(?:modify|alter)\\s+(?:column\\s+)?${partial}$`, 'i').test(tail)
+    || new RegExp(`\\bdrop\\s+column\\s+${partial}$`, 'i').test(tail)
+    || new RegExp(`\\bchange\\s+(?:column\\s+)?${partial}$`, 'i').test(tail)
+    || new RegExp(`\\brename\\s+column\\s+${partial}$`, 'i').test(tail)
+    || new RegExp(`\\bafter\\s+${partial}$`, 'i').test(tail);
+}
+
+function isColumnListCompletionContext(tail) {
+  if (/\breferences\s+[\w$`.]*\s*\([^)]*$/i.test(tail)) {
+    return false;
+  }
+  return /\b(?:primary\s+key|foreign\s+key|unique(?:\s+(?:index|key))?|index|key)\b[\s\S]*\([^)]*$/i.test(tail);
+}
+
+function objectForQualifiedName(qualifiedName, metadata) {
+  const parts = splitQualifiedIdentifier(qualifiedName);
+  return objectForTableName(parts[parts.length - 1] || qualifiedName, metadata);
+}
+
+function alterTableTailForCompletion(maskedSqlBefore) {
+  const qualified = qualifiedSqlIdentifierPatternSource();
+  const match = String(maskedSqlBefore || '').match(new RegExp(`\\balter\\s+table\\s+(?:if\\s+exists\\s+)?${qualified}([\\s\\S]*)$`, 'i'));
+  return match ? match[1] || '' : undefined;
+}
+
+function isAlterColumnDefinitionCompletionContext(tail) {
+  const identifier = sqlIdentifierPatternSource();
+  return new RegExp(`\\b(?:add|modify)\\s+(?:column\\s+)?${identifier}\\s+(?:[\\w$(),\\s]*)$`, 'i').test(tail)
+    || new RegExp(`\\bchange\\s+(?:column\\s+)?${identifier}\\s+${identifier}\\s+(?:[\\w$(),\\s]*)$`, 'i').test(tail);
+}
+
+function isCreateTableColumnDefinitionCompletionContext(maskedSqlBefore) {
+  const masked = String(maskedSqlBefore || '');
+  if (!/\bcreate\s+(?:temporary\s+)?table\b/i.test(masked)) {
+    return false;
+  }
+
+  const openIndex = masked.lastIndexOf('(');
+  const closeIndex = masked.lastIndexOf(')');
+  if (openIndex === -1 || closeIndex > openIndex) {
+    return false;
+  }
+
+  const currentDefinition = masked.slice(openIndex + 1).split(',').pop() || '';
+  if (/^\s*(?:constraint|foreign|primary|unique|key|index|check)\b/i.test(currentDefinition)) {
+    return false;
+  }
+  const identifier = sqlIdentifierPatternSource();
+  return new RegExp(`^\\s*${identifier}\\s+(?:[\\w$(),\\s]*)$`, 'i').test(currentDefinition);
+}
+
+function isSchemaStatementStartCompletionContext(maskedSqlBefore) {
+  return /^\s*[A-Za-z_]*$/i.test(String(maskedSqlBefore || ''));
+}
+
 function clampOffset(offset, text) {
   const value = Number(offset);
   const length = String(text || '').length;
@@ -3789,7 +4215,7 @@ function extractTableReferences(sql, metadata) {
   const seen = new Set();
   const identifier = sqlIdentifierPatternSource();
   const qualified = qualifiedSqlIdentifierPatternSource();
-  const directPattern = new RegExp(`\\b(?:from|join|update|into)\\s+(${qualified})(?:\\s+(?:as\\s+)?(${identifier}))?`, 'gi');
+  const directPattern = new RegExp(`\\b(?:from|join|update|into|alter\\s+table|truncate(?:\\s+table)?|describe|desc)\\s+(${qualified})(?:\\s+(?:as\\s+)?(${identifier}))?`, 'gi');
   let match;
 
   while ((match = directPattern.exec(masked))) {
@@ -3867,6 +4293,10 @@ function isTableCompletionContext(sqlBefore) {
     return true;
   }
 
+  if (isDdlTableCompletionContext(tail)) {
+    return true;
+  }
+
   const lastComma = tail.lastIndexOf(',');
   if (lastComma === -1 || !/,\s*[\w$`]*$/i.test(tail)) {
     return false;
@@ -3875,6 +4305,24 @@ function isTableCompletionContext(sqlBefore) {
   const lastFrom = lastKeywordIndex(tail, ['from']);
   const lastBlockingClause = lastKeywordIndex(tail, ['where', 'group', 'order', 'having', 'limit', 'on']);
   return lastComma > lastFrom && lastComma > lastBlockingClause;
+}
+
+function isDdlTableCompletionContext(tail) {
+  const identifier = sqlIdentifierPatternSource();
+  const qualified = qualifiedSqlIdentifierPatternSource();
+  const partial = '[\\w$`.]*';
+  const patterns = [
+    new RegExp(`\\balter\\s+table\\s+(?:if\\s+exists\\s+)?${partial}$`, 'i'),
+    new RegExp(`\\bdrop\\s+(?:temporary\\s+)?(?:table|view)\\s+(?:if\\s+exists\\s+)?(?:${qualified}\\s*,\\s*)*${partial}$`, 'i'),
+    new RegExp(`\\btruncate\\s+(?:table\\s+)?${partial}$`, 'i'),
+    new RegExp(`\\brename\\s+table\\s+(?:${qualified}\\s+to\\s+${qualified}\\s*,\\s*)*${partial}$`, 'i'),
+    new RegExp(`\\bcreate\\s+(?:temporary\\s+)?table\\s+(?:if\\s+not\\s+exists\\s+)?${qualified}\\s+like\\s+${partial}$`, 'i'),
+    new RegExp(`\\bcreate\\s+(?:unique\\s+|fulltext\\s+|spatial\\s+)?index\\s+${identifier}\\s+on\\s+${partial}$`, 'i'),
+    new RegExp(`\\bdrop\\s+index\\s+${identifier}\\s+on\\s+${partial}$`, 'i'),
+    new RegExp(`\\breferences\\s+${partial}$`, 'i'),
+    new RegExp(`\\bcreate\\s+trigger\\s+${identifier}\\s+(?:before|after)\\s+(?:insert|update|delete)\\s+on\\s+${partial}$`, 'i')
+  ];
+  return patterns.some((pattern) => pattern.test(tail));
 }
 
 function lastKeywordIndex(text, keywords) {
@@ -4884,7 +5332,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     }
 
     const SQL_INDENT = '  ';
-    const SQL_HIGHLIGHT_KEYWORDS = new Set('add all alter and as asc between by case create cross delete desc distinct drop else end exists explain from full group having in inner insert into is join left like limit not null on or order outer right select set then union update values when where with table view primary key foreign references index unique constraint database schema if begin commit rollback transaction'.split(' '));
+    const SQL_HIGHLIGHT_KEYWORDS = new Set('add algorithm all alter and as asc auto_increment between by case change column constraint create cross database default delete desc distinct drop else end exists explain foreign from full function group having if in index inner insert into is join key left like limit modify not null on or order outer primary procedure references rename right schema select set table temporary then to trigger truncate union unique update values view when where with table view primary key foreign references index unique constraint database schema if begin commit rollback transaction'.split(' '));
     const SQL_HIGHLIGHT_FUNCTIONS = new Set('avg coalesce concat count curdate date_format ifnull lower max min now nullif round sum upper'.split(' '));
 
     function handleSqlChanged(options = {}) {
@@ -6133,6 +6581,7 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
   const statusState = error ? 'error' : loading ? 'busy' : status?.state || '';
   const statusMessage = error || (loading ? 'Loading users...' : status?.message || '');
   const mode = details ? 'edit' : 'add';
+  const systemAccount = Boolean(details?.systemAccount);
 
   return `<!doctype html>
 <html lang="en">
@@ -6280,6 +6729,14 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
     .status.success {
       color: var(--success);
     }
+    .system-warning {
+      border: 1px solid var(--vscode-inputValidation-warningBorder, var(--border));
+      border-radius: 4px;
+      padding: 8px 10px;
+      color: var(--vscode-inputValidation-warningForeground, var(--vscode-editor-foreground));
+      background: var(--vscode-inputValidation-warningBackground, var(--bg-soft));
+      line-height: 1.35;
+    }
     form {
       display: grid;
       gap: 16px;
@@ -6340,6 +6797,27 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 6px 10px;
     }
+    .privilege-check,
+    .grant-option-row {
+      display: grid;
+      grid-template-columns: auto auto minmax(0, 1fr);
+      position: relative;
+      gap: 6px;
+      align-items: center;
+      min-width: 0;
+    }
+    .privilege-check .check,
+    .grant-option-row .check {
+      display: inline-flex;
+      flex: 0 0 auto;
+    }
+    .privilege-label-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 400;
+    }
     .check {
       display: flex;
       gap: 7px;
@@ -6355,9 +6833,77 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
     .check.disabled {
       color: var(--muted);
     }
+    .privilege-check.disabled .privilege-label-text {
+      color: var(--muted);
+    }
     .grant-option {
       border-bottom: 1px solid var(--border);
       padding-bottom: 9px;
+    }
+    .privilege-info {
+      flex: 0 0 auto;
+    }
+    .privilege-help {
+      display: inline-grid;
+      place-items: center;
+      width: 18px;
+      min-width: 18px;
+      min-height: 18px;
+      height: 18px;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      padding: 0;
+      color: var(--muted);
+      background: var(--secondary-bg);
+      font-size: 11px;
+      line-height: 1;
+    }
+    .privilege-help:hover,
+    .privilege-help:focus {
+      color: var(--vscode-editor-foreground);
+      background: var(--secondary-hover);
+    }
+    .privilege-popover {
+      position: fixed;
+      left: 0;
+      top: 0;
+      z-index: 100;
+      box-sizing: border-box;
+      width: min(300px, calc(100vw - 24px));
+      max-width: calc(100vw - 24px);
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--vscode-editor-foreground);
+      background: var(--vscode-editorWidget-background, var(--bg-soft));
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+      line-height: 1.35;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-2px);
+      transition: opacity 80ms ease, transform 80ms ease;
+      visibility: hidden;
+    }
+    .privilege-popover.visible {
+      opacity: 1;
+      transform: translateY(0);
+      visibility: visible;
+    }
+    .privilege-popover-title {
+      display: block;
+      margin-bottom: 3px;
+      font-weight: 600;
+    }
+    .privilege-popover-body,
+    .privilege-popover-note {
+      display: block;
+      color: var(--muted);
+    }
+    .privilege-popover-note {
+      margin-top: 5px;
+      font-size: 12px;
     }
     .empty {
       color: var(--muted);
@@ -6426,6 +6972,7 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
               <input id="managed-password" type="password" autocomplete="new-password" placeholder="${details ? 'Leave blank to keep current password' : 'Optional password'}">
             </label>
           </div>
+          ${systemAccount ? '<div id="system-warning" class="system-warning">Reserved MySQL system account. Editing can break MySQL internal features; dropping is disabled.</div>' : ''}
         </fieldset>
         <fieldset>
           <legend>Privileges</legend>
@@ -6441,7 +6988,7 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
         </fieldset>
         <div class="actions">
           <button id="save-user" type="submit">Save User</button>
-          <button id="delete-user" class="danger" type="button"${details ? '' : ' disabled'}>Drop User</button>
+          <button id="delete-user" class="danger" type="button"${details && !systemAccount ? '' : ' disabled'}>Drop User</button>
         </div>
       </form>
     </main>
@@ -6455,6 +7002,10 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
     let mode = '${mode}';
     let originalUser = initialDetails.user || '';
     let originalHost = initialDetails.host || '';
+    let selectedIsSystemAccount = ${systemAccount ? 'true' : 'false'};
+    let privilegeHelpId = 0;
+    let privilegeInputId = 0;
+    let activePrivilegeHelp;
 
     const form = document.querySelector('form');
     const userList = document.getElementById('user-list');
@@ -6463,6 +7014,7 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
     const passwordInput = document.getElementById('managed-password');
     const rowsRoot = document.getElementById('privilege-rows');
     const rawGrants = document.getElementById('raw-grants');
+    const systemWarning = document.getElementById('system-warning');
     const status = document.getElementById('status');
     const addButton = document.getElementById('add-user');
     const refreshButton = document.getElementById('refresh');
@@ -6473,7 +7025,7 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
     function setBusy(isBusy) {
       [addButton, refreshButton, addScopeButton, saveButton, deleteButton, userList].forEach((control) => {
         if (control) {
-          control.disabled = isBusy || (control === deleteButton && mode !== 'edit');
+          control.disabled = isBusy || (control === deleteButton && (mode !== 'edit' || selectedIsSystemAccount));
         }
       });
     }
@@ -6487,17 +7039,122 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
       mode = 'add';
       originalUser = '';
       originalHost = '';
+      selectedIsSystemAccount = false;
+      if (systemWarning) {
+        systemWarning.hidden = true;
+      }
       userInput.value = '';
       hostInput.value = '%';
       passwordInput.value = '';
       passwordInput.placeholder = 'Optional password';
       rawGrants.textContent = 'New user. No grants yet.';
       userList.value = '';
+      activePrivilegeHelp = undefined;
       rowsRoot.innerHTML = '';
       setEmptyPrivileges();
       setBusy(false);
       setStatus('', '');
       userInput.focus();
+    }
+
+    function positionPrivilegePopover(button, popover) {
+      const margin = 12;
+      const gap = 8;
+      const buttonRect = button.getBoundingClientRect();
+      const width = Math.min(300, Math.max(180, window.innerWidth - margin * 2));
+      popover.style.width = width + 'px';
+
+      const height = popover.offsetHeight;
+      let left = buttonRect.left + buttonRect.width / 2 - width / 2;
+      left = Math.max(margin, Math.min(window.innerWidth - width - margin, left));
+
+      let top = buttonRect.bottom + gap;
+      if (top + height + margin > window.innerHeight) {
+        top = buttonRect.top - height - gap;
+      }
+      top = Math.max(margin, Math.min(window.innerHeight - height - margin, top));
+
+      popover.style.left = left + 'px';
+      popover.style.top = top + 'px';
+    }
+
+    function showPrivilegeHelp(button, popover) {
+      if (activePrivilegeHelp?.popover && activePrivilegeHelp.popover !== popover) {
+        hidePrivilegeHelp(activePrivilegeHelp.popover);
+      }
+      activePrivilegeHelp = { button, popover };
+      positionPrivilegePopover(button, popover);
+      popover.classList.add('visible');
+    }
+
+    function hidePrivilegeHelp(popover) {
+      popover.classList.remove('visible');
+      if (activePrivilegeHelp?.popover === popover) {
+        activePrivilegeHelp = undefined;
+      }
+    }
+
+    function repositionActivePrivilegeHelp() {
+      if (activePrivilegeHelp) {
+        positionPrivilegePopover(activePrivilegeHelp.button, activePrivilegeHelp.popover);
+      }
+    }
+
+    function createPrivilegeHelp(title, description, options = {}) {
+      const info = document.createElement('span');
+      info.className = 'privilege-info';
+
+      const button = document.createElement('button');
+      button.className = 'privilege-help';
+      button.type = 'button';
+      button.textContent = '?';
+      button.setAttribute('aria-label', title + ' privilege details');
+
+      const popover = document.createElement('span');
+      popover.className = 'privilege-popover';
+      popover.id = 'privilege-help-' + (++privilegeHelpId);
+      popover.setAttribute('role', 'tooltip');
+
+      const popoverTitle = document.createElement('span');
+      popoverTitle.className = 'privilege-popover-title';
+      popoverTitle.textContent = title;
+
+      const body = document.createElement('span');
+      body.className = 'privilege-popover-body';
+      body.textContent = description || 'No description available.';
+
+      popover.appendChild(popoverTitle);
+      popover.appendChild(body);
+
+      if (options.globalOnly) {
+        const note = document.createElement('span');
+        note.className = 'privilege-popover-note';
+        note.textContent = 'Instance-level only.';
+        popover.appendChild(note);
+      }
+
+      button.setAttribute('aria-describedby', popover.id);
+      button.addEventListener('mouseenter', () => showPrivilegeHelp(button, popover));
+      button.addEventListener('focus', () => showPrivilegeHelp(button, popover));
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        showPrivilegeHelp(button, popover);
+      });
+      button.addEventListener('blur', () => hidePrivilegeHelp(popover));
+      button.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          hidePrivilegeHelp(popover);
+          button.blur();
+        }
+      });
+      info.addEventListener('mouseleave', () => {
+        if (document.activeElement !== button) {
+          hidePrivilegeHelp(popover);
+        }
+      });
+      info.appendChild(button);
+      info.appendChild(popover);
+      return info;
     }
 
     function appendPrivilegeRow(entry = {}) {
@@ -6555,35 +7212,56 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
       header.appendChild(schemaLabel);
       header.appendChild(rowActions);
 
-      const grantOptionLabel = document.createElement('label');
-      grantOptionLabel.className = 'check grant-option';
+      const grantOptionRow = document.createElement('div');
+      grantOptionRow.className = 'grant-option-row grant-option';
+      const grantOptionControl = document.createElement('span');
+      grantOptionControl.className = 'check';
       const grantOptionInput = document.createElement('input');
       grantOptionInput.type = 'checkbox';
+      grantOptionInput.id = 'grant-option-' + (++privilegeInputId);
       grantOptionInput.dataset.grantOption = 'true';
       grantOptionInput.checked = Boolean(entry.grantOption);
-      grantOptionLabel.appendChild(grantOptionInput);
-      grantOptionLabel.appendChild(document.createTextNode('WITH GRANT OPTION'));
+      grantOptionControl.appendChild(grantOptionInput);
+      const grantOptionText = document.createElement('label');
+      grantOptionText.className = 'privilege-label-text';
+      grantOptionText.htmlFor = grantOptionInput.id;
+      grantOptionText.textContent = 'WITH GRANT OPTION';
+      grantOptionRow.appendChild(grantOptionControl);
+      grantOptionRow.appendChild(createPrivilegeHelp(
+        'WITH GRANT OPTION',
+        'Allows this account to grant its selected privileges to other MySQL accounts.'
+      ));
+      grantOptionRow.appendChild(grantOptionText);
 
       const checks = document.createElement('div');
       checks.className = 'privilege-checks';
       const selected = new Set(Array.isArray(entry.privileges) ? entry.privileges : []);
       privilegeOptions.forEach((privilege) => {
-        const label = document.createElement('label');
-        label.className = 'check';
+        const item = document.createElement('div');
+        item.className = 'privilege-check';
+        const control = document.createElement('span');
+        control.className = 'check';
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
+        checkbox.id = 'privilege-option-' + (++privilegeInputId);
         checkbox.value = privilege.id;
         checkbox.dataset.privilege = 'true';
         checkbox.dataset.globalOnly = privilege.globalOnly ? 'true' : 'false';
         checkbox.checked = selected.has(privilege.id);
         checkbox.addEventListener('change', () => updateSelectAllButton(row));
-        label.appendChild(checkbox);
-        label.appendChild(document.createTextNode(privilege.label));
-        checks.appendChild(label);
+        control.appendChild(checkbox);
+        const labelText = document.createElement('label');
+        labelText.className = 'privilege-label-text';
+        labelText.htmlFor = checkbox.id;
+        labelText.textContent = privilege.label;
+        item.appendChild(control);
+        item.appendChild(createPrivilegeHelp(privilege.label, privilege.description, privilege));
+        item.appendChild(labelText);
+        checks.appendChild(item);
       });
 
       row.appendChild(header);
-      row.appendChild(grantOptionLabel);
+      row.appendChild(grantOptionRow);
       row.appendChild(checks);
       rowsRoot.appendChild(row);
 
@@ -6618,6 +7296,7 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
           checkbox.checked = false;
         }
         checkbox.closest('label')?.classList.toggle('disabled', disabled);
+        checkbox.closest('.privilege-check')?.classList.toggle('disabled', disabled);
       });
       updateSelectAllButton(row);
     }
@@ -6734,6 +7413,13 @@ function renderUserManagementHtml({ connection, schemas = [], users = [], detail
       if (message.type === 'status') {
         setBusy(message.state === 'busy');
         setStatus(message.state, message.message);
+      }
+    });
+    window.addEventListener('resize', repositionActivePrivilegeHelp);
+    window.addEventListener('scroll', repositionActivePrivilegeHelp, true);
+    document.addEventListener('click', () => {
+      if (activePrivilegeHelp) {
+        hidePrivilegeHelp(activePrivilegeHelp.popover);
       }
     });
 

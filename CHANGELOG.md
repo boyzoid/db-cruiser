@@ -1,5 +1,11 @@
 # Change Log
 
+## 0.4.4
+
+- Added privilege help popovers in user management.
+- Fixed user management system-account warnings so `SYSTEM_USER` privileges do not mark every account as reserved.
+- Added DDL-aware SQL completions for schema changes and refreshed schema metadata immediately after DDL runs.
+
 ## 0.4.3
 
 - Replaced per-column table data filters and global search with a single code-hinted toolbar `WHERE` expression.
