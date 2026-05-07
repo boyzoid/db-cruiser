@@ -35,8 +35,10 @@
     "onCommand:dbCruiser.explainQuery",
     "onCommand:dbCruiser.selectSchema",
     "onCommand:dbCruiser.refresh",
+    "onCommand:dbCruiser.refreshConnection",
     "onCommand:dbCruiser.removeConnection",
     "onCommand:dbCruiser.testConnection",
+    "onCommand:dbCruiser.manageUsers",
     "onCommand:dbCruiser.inspectObject",
     "onCommand:dbCruiser.selectTop100",
     "onCommand:dbCruiser.copyQualifiedName",
@@ -79,6 +81,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "dbCruiser.refreshConnection",
+        "title": "DB Cruiser: Refresh Connection",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "dbCruiser.removeConnection",
         "title": "DB Cruiser: Remove Connection",
         "icon": "$(trash)"
@@ -92,6 +99,11 @@
         "command": "dbCruiser.testConnection",
         "title": "DB Cruiser: Test Connection",
         "icon": "$(plug)"
+      },
+      {
+        "command": "dbCruiser.manageUsers",
+        "title": "DB Cruiser: Manage Users",
+        "icon": "$(account)"
       },
       {
         "command": "dbCruiser.openSqlConsole",
@@ -186,17 +198,27 @@
         {
           "command": "dbCruiser.testConnection",
           "when": "view == dbCruiser.connections && viewItem =~ /connection/",
-          "group": "inline@2"
+          "group": "inline@4"
         },
         {
           "command": "dbCruiser.editConnection",
           "when": "view == dbCruiser.connections && viewItem =~ /connection/",
-          "group": "inline@3"
+          "group": "inline@5"
         },
         {
           "command": "dbCruiser.removeConnection",
           "when": "view == dbCruiser.connections && viewItem =~ /connection/",
-          "group": "inline@4"
+          "group": "inline@6"
+        },
+        {
+          "command": "dbCruiser.manageUsers",
+          "when": "view == dbCruiser.connections && viewItem =~ /connection/",
+          "group": "inline@2"
+        },
+        {
+          "command": "dbCruiser.refreshConnection",
+          "when": "view == dbCruiser.connections && viewItem =~ /connection/",
+          "group": "inline@3"
         },
         {
           "command": "dbCruiser.selectTop100",

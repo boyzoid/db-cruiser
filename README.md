@@ -9,6 +9,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 - Save, edit, test, and remove MySQL connections from the DB Cruiser activity bar view.
 - Connect directly or through an SSH tunnel using password or private key authentication.
 - Add connection colors so tabs, tree items, consoles, and result views are easy to tell apart.
+- Manage MySQL users from a saved connection, including `user@host` accounts, passwords, global or schema-level privileges, and `WITH GRANT OPTION`.
 
 ### Schema Explorer
 
@@ -48,6 +49,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 - A MySQL-compatible database.
 - Network access from VS Code to the database server, or to an SSH server that can reach the database.
 - Database credentials with permission to inspect metadata and run the queries you choose.
+- User management requires MySQL privileges to inspect accounts and run user/privilege statements such as `CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`, and `REVOKE`.
 
 ## Extension Settings
 
@@ -56,6 +58,7 @@ DB Cruiser is a MySQL database explorer and SQL console for Visual Studio Code. 
 ## Security
 
 DB Cruiser stores MySQL passwords, SSH passwords, and SSH key passphrases in VS Code SecretStorage. Non-secret connection metadata is stored in VS Code extension storage.
+Passwords entered while creating or updating MySQL users are sent to MySQL for that operation and are not stored by DB Cruiser.
 
 ## Feedback
 

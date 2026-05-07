@@ -30,6 +30,36 @@ const CONNECTION_COLORS = [
   { id: 'purple', label: 'Purple', hex: '#b180d7', themeColor: 'charts.purple' }
 ];
 const CONNECTION_COLOR_IDS = new Set(CONNECTION_COLORS.map((color) => color.id));
+const USER_PRIVILEGE_OPTIONS = [
+  { id: 'SELECT', label: 'Select' },
+  { id: 'INSERT', label: 'Insert' },
+  { id: 'UPDATE', label: 'Update' },
+  { id: 'DELETE', label: 'Delete' },
+  { id: 'CREATE', label: 'Create' },
+  { id: 'DROP', label: 'Drop' },
+  { id: 'ALTER', label: 'Alter' },
+  { id: 'INDEX', label: 'Index' },
+  { id: 'REFERENCES', label: 'References' },
+  { id: 'CREATE TEMPORARY TABLES', label: 'Temporary Tables' },
+  { id: 'LOCK TABLES', label: 'Lock Tables' },
+  { id: 'EXECUTE', label: 'Execute' },
+  { id: 'CREATE VIEW', label: 'Create View' },
+  { id: 'SHOW VIEW', label: 'Show View' },
+  { id: 'CREATE ROUTINE', label: 'Create Routine' },
+  { id: 'ALTER ROUTINE', label: 'Alter Routine' },
+  { id: 'EVENT', label: 'Event' },
+  { id: 'TRIGGER', label: 'Trigger' },
+  { id: 'CREATE USER', label: 'Create User', globalOnly: true },
+  { id: 'FILE', label: 'File', globalOnly: true },
+  { id: 'PROCESS', label: 'Process', globalOnly: true },
+  { id: 'RELOAD', label: 'Reload', globalOnly: true },
+  { id: 'REPLICATION CLIENT', label: 'Replication Client', globalOnly: true },
+  { id: 'REPLICATION SLAVE', label: 'Replication Slave', globalOnly: true },
+  { id: 'SHOW DATABASES', label: 'Show Databases', globalOnly: true },
+  { id: 'SHUTDOWN', label: 'Shutdown', globalOnly: true }
+];
+const USER_PRIVILEGE_IDS = new Set(USER_PRIVILEGE_OPTIONS.map((privilege) => privilege.id));
+const USER_PRIVILEGE_ORDER = new Map(USER_PRIVILEGE_OPTIONS.map((privilege, index) => [privilege.id, index]));
 const SQL_RESERVED_WORDS = new Set([
   'add', 'all', 'alter', 'and', 'as', 'asc', 'between', 'by', 'case', 'create', 'cross',
   'delete', 'desc', 'distinct', 'drop', 'else', 'end', 'exists', 'from', 'full', 'group',
@@ -48,6 +78,7 @@ function activate(context) {
   const provider = new DatabaseTreeProvider(store, mysql);
   const resultView = new ResultView(context.extensionUri);
   const tableDataView = new TableDataView(mysql, context.extensionUri);
+  const userManagementView = new UserManagementView(mysql, context.extensionUri);
   const sqlCompletionCache = new SqlCompletionMetadataCache(mysql);
   const sqlCompletionProvider = new SqlCompletionProvider(store, consoleSessions, sqlCompletionCache);
   const sqlConsoleView = new SqlConsoleView(mysql, consoleSessions, sqlCompletionCache, context.extensionUri);
@@ -71,8 +102,10 @@ function activate(context) {
     vscode.commands.registerCommand('dbCruiser.addMySqlConnection', () => addMySqlConnection(store, mysql, provider)),
     vscode.commands.registerCommand('dbCruiser.editConnection', (node) => editConnection(node, store, mysql, provider)),
     vscode.commands.registerCommand('dbCruiser.refresh', () => provider.refresh()),
+    vscode.commands.registerCommand('dbCruiser.refreshConnection', (node) => provider.refresh(node)),
     vscode.commands.registerCommand('dbCruiser.removeConnection', (node) => removeConnection(node, store, provider)),
     vscode.commands.registerCommand('dbCruiser.testConnection', (node) => testConnection(node, mysql)),
+    vscode.commands.registerCommand('dbCruiser.manageUsers', (node) => manageUsers(node, store, userManagementView)),
     vscode.commands.registerCommand('dbCruiser.openSqlConsole', async (node) => {
       await openSqlConsole(node, store, consoleSessions, sqlConsoleView);
       updateStatus();
@@ -259,8 +292,8 @@ class DatabaseTreeProvider {
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
   }
 
-  refresh() {
-    this._onDidChangeTreeData.fire();
+  refresh(node) {
+    this._onDidChangeTreeData.fire(node);
   }
 
   getTreeItem(node) {
@@ -749,6 +782,126 @@ class MySqlAdapter {
     }
   }
 
+  async users(connection) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      const [rows] = await client.query(`
+        select
+          User as user,
+          Host as host
+        from mysql.user
+        order by User, Host
+      `);
+      return rows.map((row) => ({
+        user: String(row.user ?? row.User ?? ''),
+        host: String(row.host ?? row.Host ?? '')
+      }));
+    } finally {
+      await client.end();
+    }
+  }
+
+  async userDetails(connection, user, host) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      return await this.userDetailsWithClient(client, user, host);
+    } finally {
+      await client.end();
+    }
+  }
+
+  async userDetailsWithClient(client, user, host) {
+    const account = mysqlAccountSql(client, user, host);
+    const [rows] = await client.query(`show grants for ${account}`);
+    const grants = rows
+      .map((row) => Object.values(row || {}).find((value) => typeof value === 'string'))
+      .filter(Boolean);
+
+    return {
+      user: String(user || ''),
+      host: String(host || ''),
+      grants,
+      privileges: parseUserGrantStatements(grants)
+    };
+  }
+
+  async saveUser(connection, values) {
+    const payload = normalizeManagedUserPayload(values);
+    if (payload.errors.length > 0) {
+      throw new Error(payload.errors.join(' '));
+    }
+
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      const account = mysqlAccountSql(client, payload.user, payload.host);
+      const originalAccount = mysqlAccountSql(client, payload.originalUser, payload.originalHost);
+      const hasOriginal = payload.mode === 'edit' && payload.originalUser && payload.originalHost;
+      const accountChanged = hasOriginal && (
+        payload.user !== payload.originalUser || payload.host !== payload.originalHost
+      );
+
+      if (hasOriginal) {
+        if (accountChanged) {
+          await client.query(`rename user ${originalAccount} to ${account}`);
+        }
+        if (payload.password.length > 0) {
+          await client.query(`alter user ${account} identified by ${escapeSqlValue(client, payload.password)}`);
+        }
+      } else {
+        const passwordSql = payload.password.length > 0
+          ? ` identified by ${escapeSqlValue(client, payload.password)}`
+          : '';
+        await client.query(`create user ${account}${passwordSql}`);
+      }
+
+      await this.applyUserPrivilegeChanges(client, payload);
+      return await this.userDetailsWithClient(client, payload.user, payload.host);
+    } finally {
+      await client.end();
+    }
+  }
+
+  async applyUserPrivilegeChanges(client, payload) {
+    const account = mysqlAccountSql(client, payload.user, payload.host);
+    const details = await this.userDetailsWithClient(client, payload.user, payload.host);
+    const current = userPrivilegeEntryMap(details.privileges);
+    const desired = userPrivilegeEntryMap(payload.privileges);
+    const keys = new Set([...current.keys(), ...desired.keys()]);
+
+    for (const key of keys) {
+      const currentEntry = current.get(key) || scopeEntryFromKey(key);
+      const desiredEntry = desired.get(key) || scopeEntryFromKey(key);
+      const currentPrivileges = new Set(currentEntry.privileges || []);
+      const desiredPrivileges = new Set(desiredEntry.privileges || []);
+      const revoked = sortUserPrivilegeIds([...currentPrivileges].filter((privilege) => !desiredPrivileges.has(privilege)));
+      const granted = sortUserPrivilegeIds([...desiredPrivileges].filter((privilege) => !currentPrivileges.has(privilege)));
+      const target = userPrivilegeTargetSql(desired.get(key) || current.get(key));
+      const grantOptionRemoved = Boolean(currentEntry.grantOption) && !desiredEntry.grantOption;
+      const grantOptionAdded = !currentEntry.grantOption && Boolean(desiredEntry.grantOption);
+
+      if (grantOptionRemoved) {
+        await client.query(`revoke grant option on ${target} from ${account}`);
+      }
+      if (revoked.length > 0) {
+        await client.query(`revoke ${revoked.join(', ')} on ${target} from ${account}`);
+      }
+      if (granted.length > 0 || grantOptionAdded) {
+        const grantPrivileges = granted.length ? granted.join(', ') : 'USAGE';
+        const grantOptionSql = desiredEntry.grantOption ? ' with grant option' : '';
+        await client.query(`grant ${grantPrivileges} on ${target} to ${account}${grantOptionSql}`);
+      }
+    }
+  }
+
+  async dropUser(connection, user, host) {
+    const client = await this.connect(connection, undefined, { database: undefined });
+    try {
+      await client.query(`drop user ${mysqlAccountSql(client, user, host)}`);
+    } finally {
+      await client.end();
+    }
+  }
+
   async objects(connection, schema, type) {
     const mysqlType = type === 'view' ? 'VIEW' : 'BASE TABLE';
     const client = await this.connect(connection, undefined, { database: undefined });
@@ -1205,6 +1358,176 @@ class TableDataView {
     const content = rows.map((row) => formatDelimitedExportValue(row[column])).join('\n');
     await vscode.env.clipboard.writeText(content ? `${content}\n` : '');
     vscode.window.showInformationMessage(`Copied ${column} values from the current page.`);
+  }
+}
+
+class UserManagementView {
+  constructor(mysql, extensionUri) {
+    this.mysql = mysql;
+    this.extensionUri = extensionUri;
+    this.views = new Map();
+  }
+
+  async open(connection) {
+    if (!connection) {
+      return;
+    }
+
+    const key = connection.id;
+    let view = this.views.get(key);
+    if (!view) {
+      const panel = vscode.window.createWebviewPanel(
+        'dbCruiser.userManagement',
+        `${connection.name} Users`,
+        vscode.ViewColumn.Active,
+        {
+          enableScripts: true,
+          retainContextWhenHidden: true
+        }
+      );
+      panel.iconPath = connectionPanelIconPath(this.extensionUri, connection);
+      view = {
+        panel,
+        connection,
+        selected: undefined
+      };
+      this.views.set(key, view);
+      panel.webview.onDidReceiveMessage((message) => this.handleMessage(key, message));
+      panel.onDidDispose(() => this.views.delete(key));
+      panel.webview.html = renderUserManagementHtml({
+        connection,
+        loading: true
+      });
+    } else {
+      view.connection = connection;
+      view.panel.reveal(vscode.ViewColumn.Active);
+      view.panel.title = `${connection.name} Users`;
+      view.panel.iconPath = connectionPanelIconPath(this.extensionUri, connection);
+    }
+
+    await this.reload(view);
+  }
+
+  async handleMessage(key, message) {
+    const view = this.views.get(key);
+    if (!view || !message?.command) {
+      return;
+    }
+
+    if (message.command === 'reload') {
+      await this.reload(view);
+      return;
+    }
+
+    if (message.command === 'selectUser') {
+      view.selected = {
+        user: String(message.user || ''),
+        host: String(message.host || '')
+      };
+      await this.reload(view);
+      return;
+    }
+
+    if (message.command === 'saveUser') {
+      await this.save(view, message.values);
+      return;
+    }
+
+    if (message.command === 'deleteUser') {
+      await this.delete(view, message.user, message.host);
+    }
+  }
+
+  async reload(view, status) {
+    view.panel.title = `${view.connection.name} Users`;
+    view.panel.iconPath = connectionPanelIconPath(this.extensionUri, view.connection);
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Loading users for ${view.connection.name}`,
+        cancellable: false
+      },
+      async () => {
+        try {
+          const [schemas, users] = await Promise.all([
+            this.mysql.schemas(view.connection),
+            this.mysql.users(view.connection)
+          ]);
+          const selected = pickSelectedManagedUser(users, view.selected);
+          view.selected = selected;
+          const details = selected
+            ? await this.mysql.userDetails(view.connection, selected.user, selected.host)
+            : undefined;
+          view.panel.webview.html = renderUserManagementHtml({
+            connection: view.connection,
+            schemas,
+            users,
+            details,
+            status
+          });
+        } catch (error) {
+          view.panel.webview.html = renderUserManagementHtml({
+            connection: view.connection,
+            schemas: [],
+            users: [],
+            error: errorMessage(error)
+          });
+        }
+      }
+    );
+  }
+
+  async save(view, values) {
+    await this.postStatus(view, 'busy', 'Saving user...');
+    try {
+      const details = await this.mysql.saveUser(view.connection, values);
+      view.selected = {
+        user: details.user,
+        host: details.host
+      };
+      await this.reload(view, {
+        state: 'success',
+        message: `Saved ${formatUserAccount(details)}.`
+      });
+      vscode.window.showInformationMessage(`Saved ${formatUserAccount(details)}.`);
+    } catch (error) {
+      await this.postStatus(view, 'error', errorMessage(error));
+    }
+  }
+
+  async delete(view, user, host) {
+    const account = formatUserAccount({ user, host });
+    const answer = await vscode.window.showWarningMessage(
+      `Drop MySQL user ${account}? This cannot be undone by DB Cruiser.`,
+      { modal: true },
+      'Drop User'
+    );
+    if (answer !== 'Drop User') {
+      await this.postStatus(view, '', '');
+      return;
+    }
+
+    await this.postStatus(view, 'busy', `Dropping ${account}...`);
+    try {
+      await this.mysql.dropUser(view.connection, user, host);
+      view.selected = undefined;
+      await this.reload(view, {
+        state: 'success',
+        message: `Dropped ${account}.`
+      });
+      vscode.window.showInformationMessage(`Dropped ${account}.`);
+    } catch (error) {
+      await this.postStatus(view, 'error', errorMessage(error));
+    }
+  }
+
+  async postStatus(view, state, message) {
+    await view.panel.webview.postMessage({
+      type: 'status',
+      state,
+      message
+    });
   }
 }
 
@@ -1808,6 +2131,15 @@ async function testConnection(node, mysql) {
   }
 }
 
+async function manageUsers(node, store, userManagementView) {
+  const connection = node?.connection || await pickConnection(store);
+  if (!connection) {
+    return;
+  }
+
+  await userManagementView.open(connection);
+}
+
 async function openSqlConsole(node, store, consoleSessions, sqlConsoleView) {
   const connection = node?.connection || await pickConnection(store);
   if (!connection) {
@@ -2282,6 +2614,302 @@ function joinAlias(index) {
 
 function formatColumnReference(alias, column) {
   return `${formatSqlIdentifier(alias)}.${quoteIdentifier(column)}`;
+}
+
+function pickSelectedManagedUser(users, selected) {
+  if (!users.length) {
+    return undefined;
+  }
+  if (selected) {
+    const match = users.find((user) => user.user === selected.user && user.host === selected.host);
+    if (match) {
+      return match;
+    }
+  }
+  return users[0];
+}
+
+function formatUserAccount(account) {
+  const user = String(account?.user || '');
+  const host = String(account?.host || '');
+  return `${user || '(anonymous)'}@${host || '(no host)'}`;
+}
+
+function normalizeManagedUserPayload(values = {}) {
+  const mode = values.mode === 'edit' ? 'edit' : 'add';
+  const user = String(values.user || '').trim();
+  const host = String(values.host || '').trim();
+  const originalUser = String(values.originalUser || '').trim();
+  const originalHost = String(values.originalHost || '').trim();
+  const password = String(values.password ?? '');
+  const errors = [];
+
+  if (!user) {
+    errors.push('Username is required.');
+  }
+  if (!host) {
+    errors.push('Host is required.');
+  }
+  if (mode === 'edit' && (!originalUser || !originalHost)) {
+    errors.push('The original user account could not be identified.');
+  }
+  if (containsUnsafeAccountCharacter(user)) {
+    errors.push('Username cannot contain line breaks or NUL characters.');
+  }
+  if (containsUnsafeAccountCharacter(host)) {
+    errors.push('Host cannot contain line breaks or NUL characters.');
+  }
+  if (password.includes('\0')) {
+    errors.push('Password cannot contain NUL characters.');
+  }
+
+  return {
+    mode,
+    user,
+    host,
+    originalUser,
+    originalHost,
+    password,
+    privileges: normalizeUserPrivilegeRows(values.privileges),
+    errors
+  };
+}
+
+function containsUnsafeAccountCharacter(value) {
+  return /[\0\r\n]/.test(String(value || ''));
+}
+
+function normalizeUserPrivilegeRows(rows) {
+  const map = new Map();
+  const source = Array.isArray(rows) ? rows : [];
+
+  source.forEach((row) => {
+    const scope = row?.scope === 'global' ? 'global' : 'schema';
+    const schema = scope === 'schema' ? String(row?.schema || '').trim() : '';
+    if (scope === 'schema' && !schema) {
+      return;
+    }
+
+    const privileges = sortUserPrivilegeIds(Array.from(new Set(
+      (Array.isArray(row?.privileges) ? row.privileges : [])
+        .map(normalizeUserPrivilegeId)
+        .filter((privilege) => isAllowedUserPrivilege(privilege, scope))
+    )));
+    const grantOption = row?.grantOption === true || row?.grantOption === 'true';
+    if (!privileges.length && !grantOption) {
+      return;
+    }
+
+    mergeUserPrivilegeEntry(map, {
+      scope,
+      schema,
+      privileges,
+      grantOption
+    });
+  });
+
+  return sortUserPrivilegeEntries([...map.values()]);
+}
+
+function parseUserGrantStatements(grants) {
+  const map = new Map();
+
+  (Array.isArray(grants) ? grants : []).forEach((grant) => {
+    const statement = String(grant || '');
+    const match = statement.match(/^GRANT\s+(.+?)\s+ON\s+(.+?)\s+TO\s+/i);
+    if (!match) {
+      return;
+    }
+
+    const target = parseUserGrantTarget(match[2]);
+    if (!target) {
+      return;
+    }
+
+    const privileges = parseUserGrantPrivileges(match[1], target.scope);
+    const grantOption = /\bWITH\s+GRANT\s+OPTION\b/i.test(statement);
+    if (!privileges.length && !grantOption) {
+      return;
+    }
+
+    mergeUserPrivilegeEntry(map, {
+      ...target,
+      privileges,
+      grantOption
+    });
+  });
+
+  return sortUserPrivilegeEntries([...map.values()]);
+}
+
+function parseUserGrantTarget(value) {
+  const target = String(value || '').trim();
+  if (target === '*.*') {
+    return {
+      scope: 'global',
+      schema: ''
+    };
+  }
+
+  const match = target.match(/^(.+)\.\*$/);
+  if (!match) {
+    return undefined;
+  }
+
+  const schema = unquoteGrantIdentifier(match[1]);
+  return schema
+    ? {
+        scope: 'schema',
+        schema
+      }
+    : undefined;
+}
+
+function unquoteGrantIdentifier(value) {
+  const text = String(value || '').trim();
+  if (text.length >= 2 && text.startsWith('`') && text.endsWith('`')) {
+    return text.slice(1, -1).replace(/``/g, '`');
+  }
+  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1).replace(/\\'/g, "'").replace(/''/g, "'");
+  }
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
+    return text.slice(1, -1).replace(/\\"/g, '"').replace(/""/g, '"');
+  }
+  return text;
+}
+
+function parseUserGrantPrivileges(value, scope) {
+  const text = normalizeGrantPrivilegeText(value);
+  if (!text || text === 'USAGE') {
+    return [];
+  }
+  if (text === 'ALL' || text === 'ALL PRIVILEGES') {
+    return managedPrivilegesForScope(scope);
+  }
+
+  return sortUserPrivilegeIds(text
+    .split(',')
+    .map(normalizeUserPrivilegeId)
+    .filter((privilege) => isAllowedUserPrivilege(privilege, scope)));
+}
+
+function normalizeGrantPrivilegeText(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
+function normalizeUserPrivilegeId(value) {
+  return normalizeGrantPrivilegeText(value).replace(/\s+PRIVILEGE$/, '');
+}
+
+function managedPrivilegesForScope(scope) {
+  return USER_PRIVILEGE_OPTIONS
+    .filter((privilege) => scope === 'global' || !privilege.globalOnly)
+    .map((privilege) => privilege.id);
+}
+
+function isAllowedUserPrivilege(privilege, scope) {
+  if (!USER_PRIVILEGE_IDS.has(privilege)) {
+    return false;
+  }
+  const option = USER_PRIVILEGE_OPTIONS.find((candidate) => candidate.id === privilege);
+  return scope === 'global' || !option?.globalOnly;
+}
+
+function mergeUserPrivilegeEntry(map, entry) {
+  const key = userPrivilegeEntryKey(entry);
+  const existing = map.get(key);
+  if (!existing) {
+    map.set(key, {
+      scope: entry.scope,
+      schema: entry.schema || '',
+      privileges: sortUserPrivilegeIds(entry.privileges || []),
+      grantOption: Boolean(entry.grantOption)
+    });
+    return;
+  }
+
+  existing.privileges = sortUserPrivilegeIds([...new Set([
+    ...existing.privileges,
+    ...(entry.privileges || [])
+  ])]);
+  existing.grantOption = existing.grantOption || Boolean(entry.grantOption);
+}
+
+function userPrivilegeEntryMap(entries) {
+  return (Array.isArray(entries) ? entries : []).reduce((map, entry) => {
+    mergeUserPrivilegeEntry(map, entry);
+    return map;
+  }, new Map());
+}
+
+function userPrivilegeEntryKey(entry) {
+  return entry?.scope === 'global'
+    ? 'global'
+    : `schema:${String(entry?.schema || '')}`;
+}
+
+function scopeEntryFromKey(key) {
+  const value = String(key || '');
+  if (value === 'global') {
+    return {
+      scope: 'global',
+      schema: '',
+      privileges: [],
+      grantOption: false
+    };
+  }
+  return {
+    scope: 'schema',
+    schema: value.startsWith('schema:') ? value.slice('schema:'.length) : '',
+    privileges: [],
+    grantOption: false
+  };
+}
+
+function sortUserPrivilegeEntries(entries) {
+  return entries.sort((left, right) => {
+    if (left.scope !== right.scope) {
+      return left.scope === 'global' ? -1 : 1;
+    }
+    return String(left.schema || '').localeCompare(String(right.schema || ''));
+  });
+}
+
+function sortUserPrivilegeIds(privileges) {
+  return Array.from(new Set(privileges)).sort((left, right) => {
+    const leftIndex = USER_PRIVILEGE_ORDER.has(left) ? USER_PRIVILEGE_ORDER.get(left) : Number.MAX_SAFE_INTEGER;
+    const rightIndex = USER_PRIVILEGE_ORDER.has(right) ? USER_PRIVILEGE_ORDER.get(right) : Number.MAX_SAFE_INTEGER;
+    return leftIndex - rightIndex || String(left).localeCompare(String(right));
+  });
+}
+
+function userPrivilegeTargetSql(entry) {
+  if (entry?.scope === 'global') {
+    return '*.*';
+  }
+  return `${quoteIdentifier(entry?.schema || '')}.*`;
+}
+
+function mysqlAccountSql(client, user, host) {
+  return `${escapeSqlValue(client, user)}@${escapeSqlValue(client, host)}`;
+}
+
+function escapeSqlValue(client, value) {
+  if (typeof client?.escape === 'function') {
+    return client.escape(value);
+  }
+  if (typeof client?.connection?.escape === 'function') {
+    return client.connection.escape(value);
+  }
+  return quoteSqlString(value);
+}
+
+function quoteSqlString(value) {
+  return `'${String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\0/g, '\\0')
+    .replace(/'/g, "\\'")}'`;
 }
 
 async function pickConnection(store) {
@@ -5487,6 +6115,644 @@ function renderConnectionFormHtml({ connection } = {}) {
   </script>
 </body>
 </html>`;
+}
+
+function renderUserManagementHtml({ connection, schemas = [], users = [], details, loading = false, status, error = '' } = {}) {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const accentColor = escapeHtml(connectionAccentColor(connection));
+  const schemaNames = schemas.map((schema) => schema.name).filter(Boolean);
+  const selectedDetails = details || {
+    user: '',
+    host: '%',
+    grants: [],
+    privileges: []
+  };
+  const selectedIndex = details
+    ? users.findIndex((user) => user.user === details.user && user.host === details.host)
+    : -1;
+  const statusState = error ? 'error' : loading ? 'busy' : status?.state || '';
+  const statusMessage = error || (loading ? 'Loading users...' : status?.message || '');
+  const mode = details ? 'edit' : 'add';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style nonce="${nonce}">
+    :root {
+      color-scheme: light dark;
+      --border: var(--vscode-panel-border, var(--vscode-editorWidget-border, transparent));
+      --muted: var(--vscode-descriptionForeground, var(--vscode-editor-foreground));
+      --bg-soft: var(--vscode-editorWidget-background, var(--vscode-sideBar-background, var(--vscode-editor-background)));
+      --input-bg: var(--vscode-input-background, var(--vscode-editor-background));
+      --input-fg: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+      --input-border: var(--vscode-input-border, var(--vscode-panel-border, transparent));
+      --button-bg: var(--vscode-button-background, var(--vscode-button-secondaryBackground));
+      --button-fg: var(--vscode-button-foreground, var(--vscode-button-secondaryForeground));
+      --button-hover: var(--vscode-button-hoverBackground, var(--vscode-button-secondaryHoverBackground));
+      --secondary-bg: var(--vscode-button-secondaryBackground);
+      --secondary-fg: var(--vscode-button-secondaryForeground);
+      --secondary-hover: var(--vscode-button-secondaryHoverBackground);
+      --error: var(--vscode-errorForeground, #f14c4c);
+      --success: var(--vscode-testing-iconPassed, #73c991);
+      --connection-color: ${accentColor};
+    }
+    body {
+      margin: 0;
+      color: var(--vscode-editor-foreground);
+      background: var(--vscode-editor-background);
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+    }
+    .manager {
+      display: grid;
+      grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
+      min-height: 100vh;
+      border-top: 3px solid var(--connection-color);
+    }
+    aside {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      gap: 10px;
+      border-right: 1px solid var(--border);
+      padding: 14px;
+      background: var(--bg-soft);
+    }
+    .title h1 {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin: 0 0 4px;
+      overflow-wrap: anywhere;
+      font-size: 15px;
+      font-weight: 600;
+    }
+    .connection-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--connection-color);
+      flex: 0 0 auto;
+    }
+    .meta,
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .side-actions,
+    .actions,
+    .scope-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    select,
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 30px;
+      border: 1px solid var(--input-border);
+      border-radius: 4px;
+      padding: 5px 8px;
+      color: var(--input-fg);
+      background: var(--input-bg);
+      font: inherit;
+    }
+    select:focus,
+    input:focus,
+    button:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+    #user-list {
+      min-height: 240px;
+    }
+    button {
+      border: 0;
+      border-radius: 4px;
+      min-height: 30px;
+      padding: 5px 10px;
+      color: var(--button-fg);
+      background: var(--button-bg);
+      font: inherit;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button:hover {
+      background: var(--button-hover);
+    }
+    button.secondary,
+    button.danger {
+      color: var(--secondary-fg);
+      background: var(--secondary-bg);
+    }
+    button.secondary:hover,
+    button.danger:hover {
+      background: var(--secondary-hover);
+    }
+    button.danger {
+      color: var(--error);
+    }
+    button:disabled,
+    input:disabled,
+    select:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    main {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-width: 0;
+    }
+    .status {
+      min-height: 18px;
+      border-bottom: 1px solid var(--border);
+      padding: 9px 14px;
+      color: var(--muted);
+    }
+    .status.error {
+      color: var(--error);
+    }
+    .status.success {
+      color: var(--success);
+    }
+    form {
+      display: grid;
+      gap: 16px;
+      align-content: start;
+      overflow: auto;
+      padding: 16px;
+    }
+    fieldset {
+      display: grid;
+      gap: 12px;
+      margin: 0;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--vscode-editor-background);
+    }
+    legend {
+      padding: 0 4px;
+      font-weight: 600;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+      font-weight: 600;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .privilege-rows {
+      display: grid;
+      gap: 10px;
+    }
+    .privilege-row {
+      display: grid;
+      gap: 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--bg-soft);
+    }
+    .privilege-row-header {
+      display: grid;
+      grid-template-columns: 140px minmax(160px, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+    .row-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    .privilege-checks {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 6px 10px;
+    }
+    .check {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+      min-width: 0;
+      color: var(--vscode-editor-foreground);
+      font-weight: 400;
+    }
+    .check input {
+      width: auto;
+      min-height: 0;
+    }
+    .check.disabled {
+      color: var(--muted);
+    }
+    .grant-option {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 9px;
+    }
+    .empty {
+      color: var(--muted);
+      padding: 8px 0;
+    }
+    pre {
+      margin: 0;
+      max-height: 240px;
+      overflow: auto;
+      padding: 12px;
+      color: var(--vscode-editor-foreground);
+      background: var(--vscode-textCodeBlock-background, var(--bg-soft));
+      font-family: var(--vscode-editor-font-family);
+      font-size: var(--vscode-editor-font-size);
+      white-space: pre-wrap;
+    }
+    @media (max-width: 820px) {
+      .manager {
+        grid-template-columns: 1fr;
+      }
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+      #user-list {
+        min-height: 150px;
+      }
+      .grid,
+      .privilege-row-header {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="manager">
+    <aside>
+      <div class="title">
+        <h1><span class="connection-dot" aria-hidden="true"></span>${escapeHtml(connection?.name || 'Connection')} Users</h1>
+        <div class="meta">${escapeHtml(describeConnection(connection || {}))}</div>
+      </div>
+      <div class="side-actions">
+        <button id="add-user" type="button">Add User</button>
+        <button id="refresh" class="secondary" type="button">Refresh</button>
+      </div>
+      <select id="user-list" size="14" aria-label="MySQL users"${loading ? ' disabled' : ''}>
+        ${renderManagedUserOptions(users, selectedIndex)}
+      </select>
+    </aside>
+    <main>
+      <div id="status" class="status${statusState ? ` ${escapeHtml(statusState)}` : ''}" role="status" aria-live="polite">${escapeHtml(statusMessage)}</div>
+      <form>
+        <fieldset>
+          <legend>Account</legend>
+          <div class="grid">
+            <label>
+              Username
+              <input id="managed-user" value="${escapeHtml(selectedDetails.user)}" required autocomplete="username">
+            </label>
+            <label>
+              Host
+              <input id="managed-host" value="${escapeHtml(selectedDetails.host)}" required autocomplete="off" placeholder="localhost or %">
+            </label>
+            <label>
+              Password
+              <input id="managed-password" type="password" autocomplete="new-password" placeholder="${details ? 'Leave blank to keep current password' : 'Optional password'}">
+            </label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Privileges</legend>
+          <div class="scope-actions">
+            <button id="add-scope" class="secondary" type="button">Add Scope</button>
+            <span class="hint">Scopes apply to the whole instance or to every object in a schema.</span>
+          </div>
+          <div id="privilege-rows" class="privilege-rows"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Raw Grants</legend>
+          <pre id="raw-grants">${escapeHtml((selectedDetails.grants || []).join('\n') || 'No grants loaded.')}</pre>
+        </fieldset>
+        <div class="actions">
+          <button id="save-user" type="submit">Save User</button>
+          <button id="delete-user" class="danger" type="button"${details ? '' : ' disabled'}>Drop User</button>
+        </div>
+      </form>
+    </main>
+  </div>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const schemas = ${scriptJson(schemaNames)};
+    const users = ${scriptJson(users)};
+    const privilegeOptions = ${scriptJson(USER_PRIVILEGE_OPTIONS)};
+    const initialDetails = ${scriptJson(selectedDetails)};
+    let mode = '${mode}';
+    let originalUser = initialDetails.user || '';
+    let originalHost = initialDetails.host || '';
+
+    const form = document.querySelector('form');
+    const userList = document.getElementById('user-list');
+    const userInput = document.getElementById('managed-user');
+    const hostInput = document.getElementById('managed-host');
+    const passwordInput = document.getElementById('managed-password');
+    const rowsRoot = document.getElementById('privilege-rows');
+    const rawGrants = document.getElementById('raw-grants');
+    const status = document.getElementById('status');
+    const addButton = document.getElementById('add-user');
+    const refreshButton = document.getElementById('refresh');
+    const addScopeButton = document.getElementById('add-scope');
+    const saveButton = document.getElementById('save-user');
+    const deleteButton = document.getElementById('delete-user');
+
+    function setBusy(isBusy) {
+      [addButton, refreshButton, addScopeButton, saveButton, deleteButton, userList].forEach((control) => {
+        if (control) {
+          control.disabled = isBusy || (control === deleteButton && mode !== 'edit');
+        }
+      });
+    }
+
+    function setStatus(state, message) {
+      status.className = state ? 'status ' + state : 'status';
+      status.textContent = message || '';
+    }
+
+    function resetForAdd() {
+      mode = 'add';
+      originalUser = '';
+      originalHost = '';
+      userInput.value = '';
+      hostInput.value = '%';
+      passwordInput.value = '';
+      passwordInput.placeholder = 'Optional password';
+      rawGrants.textContent = 'New user. No grants yet.';
+      userList.value = '';
+      rowsRoot.innerHTML = '';
+      setEmptyPrivileges();
+      setBusy(false);
+      setStatus('', '');
+      userInput.focus();
+    }
+
+    function appendPrivilegeRow(entry = {}) {
+      const empty = rowsRoot.querySelector('.empty');
+      if (empty) {
+        empty.remove();
+      }
+
+      const row = document.createElement('div');
+      row.className = 'privilege-row';
+
+      const header = document.createElement('div');
+      header.className = 'privilege-row-header';
+
+      const scopeLabel = document.createElement('label');
+      scopeLabel.textContent = 'Scope';
+      const scopeSelect = document.createElement('select');
+      scopeSelect.dataset.scope = 'true';
+      scopeSelect.appendChild(optionElement('schema', 'Schema', entry.scope !== 'global'));
+      scopeSelect.appendChild(optionElement('global', 'Instance', entry.scope === 'global'));
+      scopeLabel.appendChild(scopeSelect);
+
+      const schemaLabel = document.createElement('label');
+      schemaLabel.textContent = 'Schema';
+      const schemaSelect = document.createElement('select');
+      schemaSelect.dataset.schema = 'true';
+      if (schemas.length) {
+        schemas.forEach((schema) => schemaSelect.appendChild(optionElement(schema, schema, schema === entry.schema)));
+      } else {
+        schemaSelect.appendChild(optionElement('', 'No schemas available', true));
+      }
+      schemaLabel.appendChild(schemaSelect);
+
+      const remove = document.createElement('button');
+      remove.className = 'secondary';
+      remove.type = 'button';
+      remove.textContent = 'Remove';
+      remove.addEventListener('click', () => {
+        row.remove();
+        setEmptyPrivileges();
+      });
+
+      const toggleAll = document.createElement('button');
+      toggleAll.className = 'secondary';
+      toggleAll.type = 'button';
+      toggleAll.dataset.toggleAll = 'true';
+      toggleAll.addEventListener('click', () => toggleRowPrivileges(row));
+
+      const rowActions = document.createElement('div');
+      rowActions.className = 'row-actions';
+      rowActions.appendChild(toggleAll);
+      rowActions.appendChild(remove);
+
+      header.appendChild(scopeLabel);
+      header.appendChild(schemaLabel);
+      header.appendChild(rowActions);
+
+      const grantOptionLabel = document.createElement('label');
+      grantOptionLabel.className = 'check grant-option';
+      const grantOptionInput = document.createElement('input');
+      grantOptionInput.type = 'checkbox';
+      grantOptionInput.dataset.grantOption = 'true';
+      grantOptionInput.checked = Boolean(entry.grantOption);
+      grantOptionLabel.appendChild(grantOptionInput);
+      grantOptionLabel.appendChild(document.createTextNode('WITH GRANT OPTION'));
+
+      const checks = document.createElement('div');
+      checks.className = 'privilege-checks';
+      const selected = new Set(Array.isArray(entry.privileges) ? entry.privileges : []);
+      privilegeOptions.forEach((privilege) => {
+        const label = document.createElement('label');
+        label.className = 'check';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.value = privilege.id;
+        checkbox.dataset.privilege = 'true';
+        checkbox.dataset.globalOnly = privilege.globalOnly ? 'true' : 'false';
+        checkbox.checked = selected.has(privilege.id);
+        checkbox.addEventListener('change', () => updateSelectAllButton(row));
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode(privilege.label));
+        checks.appendChild(label);
+      });
+
+      row.appendChild(header);
+      row.appendChild(grantOptionLabel);
+      row.appendChild(checks);
+      rowsRoot.appendChild(row);
+
+      scopeSelect.addEventListener('change', () => syncPrivilegeRow(row));
+      syncPrivilegeRow(row);
+    }
+
+    function optionElement(value, label, selected) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      option.selected = Boolean(selected);
+      return option;
+    }
+
+    function syncPrivilegeRow(row) {
+      const scopeSelect = row.querySelector('[data-scope]');
+      const schemaSelect = row.querySelector('[data-schema]');
+      const schemaLabel = schemaSelect?.closest('label');
+      const isGlobal = scopeSelect?.value === 'global';
+      if (schemaLabel) {
+        schemaLabel.hidden = isGlobal;
+      }
+      if (schemaSelect) {
+        schemaSelect.disabled = isGlobal || !schemas.length;
+      }
+
+      row.querySelectorAll('[data-privilege]').forEach((checkbox) => {
+        const disabled = !isGlobal && checkbox.dataset.globalOnly === 'true';
+        checkbox.disabled = disabled;
+        if (disabled) {
+          checkbox.checked = false;
+        }
+        checkbox.closest('label')?.classList.toggle('disabled', disabled);
+      });
+      updateSelectAllButton(row);
+    }
+
+    function enabledPrivilegeCheckboxes(row) {
+      return [...row.querySelectorAll('[data-privilege]')].filter((checkbox) => !checkbox.disabled);
+    }
+
+    function updateSelectAllButton(row) {
+      const button = row.querySelector('[data-toggle-all]');
+      if (!button) {
+        return;
+      }
+      const checkboxes = enabledPrivilegeCheckboxes(row);
+      const allSelected = checkboxes.length > 0 && checkboxes.every((checkbox) => checkbox.checked);
+      button.textContent = allSelected ? 'Deselect All' : 'Select All';
+      button.disabled = checkboxes.length === 0;
+    }
+
+    function toggleRowPrivileges(row) {
+      const checkboxes = enabledPrivilegeCheckboxes(row);
+      const shouldSelect = !checkboxes.every((checkbox) => checkbox.checked);
+      checkboxes.forEach((checkbox) => {
+        checkbox.checked = shouldSelect;
+      });
+      updateSelectAllButton(row);
+    }
+
+    function setEmptyPrivileges() {
+      if (!rowsRoot.querySelector('.privilege-row')) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No managed privilege scopes.';
+        rowsRoot.appendChild(empty);
+      }
+    }
+
+    function collectPrivileges() {
+      return [...rowsRoot.querySelectorAll('.privilege-row')].map((row) => {
+        const scope = row.querySelector('[data-scope]')?.value || 'schema';
+        return {
+          scope,
+          schema: scope === 'schema' ? row.querySelector('[data-schema]')?.value || '' : '',
+          grantOption: row.querySelector('[data-grant-option]')?.checked === true,
+          privileges: [...row.querySelectorAll('[data-privilege]:checked')].map((checkbox) => checkbox.value)
+        };
+      });
+    }
+
+    function saveUser() {
+      if (!form.reportValidity()) {
+        return;
+      }
+      setBusy(true);
+      setStatus('busy', 'Saving user...');
+      vscode.postMessage({
+        command: 'saveUser',
+        values: {
+          mode,
+          originalUser,
+          originalHost,
+          user: userInput.value,
+          host: hostInput.value,
+          password: passwordInput.value,
+          privileges: collectPrivileges()
+        }
+      });
+    }
+
+    addButton.addEventListener('click', resetForAdd);
+    refreshButton.addEventListener('click', () => {
+      setBusy(true);
+      setStatus('busy', 'Refreshing users...');
+      vscode.postMessage({ command: 'reload' });
+    });
+    addScopeButton.addEventListener('click', () => {
+      appendPrivilegeRow({
+        scope: schemas.length ? 'schema' : 'global',
+        schema: schemas[0] || '',
+        privileges: []
+      });
+    });
+    deleteButton.addEventListener('click', () => {
+      if (mode !== 'edit') {
+        return;
+      }
+      setBusy(true);
+      setStatus('busy', 'Confirming user drop...');
+      vscode.postMessage({
+        command: 'deleteUser',
+        user: originalUser,
+        host: originalHost
+      });
+    });
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveUser();
+    });
+    userList.addEventListener('change', () => {
+      const user = users[Number(userList.value)];
+      if (!user) {
+        return;
+      }
+      setBusy(true);
+      setStatus('busy', 'Loading grants...');
+      vscode.postMessage({
+        command: 'selectUser',
+        user: user.user,
+        host: user.host
+      });
+    });
+    window.addEventListener('message', (event) => {
+      const message = event.data || {};
+      if (message.type === 'status') {
+        setBusy(message.state === 'busy');
+        setStatus(message.state, message.message);
+      }
+    });
+
+    (initialDetails.privileges || []).forEach(appendPrivilegeRow);
+    setEmptyPrivileges();
+    setBusy(false);
+  </script>
+</body>
+</html>`;
+}
+
+function renderManagedUserOptions(users, selectedIndex) {
+  if (!users.length) {
+    return '<option disabled>No MySQL users found</option>';
+  }
+
+  return users.map((user, index) => (
+    `<option value="${index}"${index === selectedIndex ? ' selected' : ''}>${escapeHtml(formatUserAccount(user))}</option>`
+  )).join('');
 }
 
 function renderTableDataViewHtml({ view, loading = false, error = '' }) {
