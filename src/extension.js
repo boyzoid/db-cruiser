@@ -7482,6 +7482,11 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
       --suggest-selected: var(--vscode-editorSuggestWidget-selectedBackground, var(--vscode-list-activeSelectionBackground));
       --connection-color: ${accentColor};
     }
+    html,
+    body {
+      height: 100%;
+      overflow: hidden;
+    }
     body {
       margin: 0;
       color: var(--vscode-editor-foreground);
@@ -7492,7 +7497,10 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
     .data-view {
       display: grid;
       grid-template-rows: auto auto minmax(0, 1fr);
-      min-height: 100vh;
+      height: 100vh;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
     }
     .toolbar {
       display: grid;
@@ -7647,6 +7655,8 @@ function renderTableDataViewHtml({ view, loading = false, error = '' }) {
       color: var(--error);
     }
     .grid-wrap {
+      min-height: 0;
+      min-width: 0;
       overflow: auto;
     }
     table {

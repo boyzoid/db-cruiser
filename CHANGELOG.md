@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.4.5
+
+- Fixed table data views so wide result sets expose the horizontal scrollbar while column headers remain visible.
+
 ## 0.4.4
 
 - Added privilege help popovers in user management.
