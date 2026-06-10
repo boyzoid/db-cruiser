@@ -17,6 +17,7 @@ const SSH_PASSPHRASE_PREFIX = 'dbCruiser.ssh.passphrase.';
 const DEFAULT_ROW_LIMIT = 500;
 const ROW_LIMIT_OPTIONS = [5, 10, 20, 25, 100, 200, 300, 400, 500];
 const NO_ROW_LIMIT = 'none';
+const FIRST_RESULT_PAGE = 0;
 const DEFAULT_DATA_VIEW_PAGE_SIZE = 100;
 const DATA_VIEW_PAGE_SIZE_OPTIONS = [25, 50, 100, 200, 500];
 const METADATA_CACHE_TTL_MS = 60 * 1000;
@@ -1651,7 +1652,7 @@ class SqlConsoleView {
     });
 
     panel.webview.onDidReceiveMessage(async (message) => {
-      if (!message || !['run', 'explain', 'schemaChanged', 'rowLimitChanged', 'sqlChanged', 'completion', 'exportResultSet'].includes(message.command)) {
+      if (!message || !['run', 'pageQuery', 'explain', 'schemaChanged', 'rowLimitChanged', 'sqlChanged', 'completion', 'exportResultSet'].includes(message.command)) {
         return;
       }
 
@@ -1710,7 +1711,9 @@ class SqlConsoleView {
         return;
       }
 
-      await this.run(panel, connection, nextSchema, sql, rowLimit);
+      await this.run(panel, connection, nextSchema, sql, rowLimit, {
+        page: message.command === 'pageQuery' ? message.page : FIRST_RESULT_PAGE
+      });
     }, undefined, disposables);
 
     panel.onDidDispose(() => {
@@ -1748,25 +1751,29 @@ class SqlConsoleView {
     }
   }
 
-  async run(panel, connection, schema, sql, rowLimit) {
+  async run(panel, connection, schema, sql, rowLimit, options = {}) {
+    const queryPage = normalizeResultPage(options.page);
+    const query = buildConsoleQuery(sql, rowLimit, queryPage);
     await panel.webview.postMessage({
       type: 'status',
       state: 'busy',
-      message: `Running on ${schema || connection.database || connection.name} (${formatRowLimit(rowLimit)})...`
+      message: `Running${query.pagination ? ` page ${query.pagination.page + 1}` : ''} on ${schema || connection.database || connection.name} (${formatRowLimit(rowLimit)})...`
     });
 
     try {
       const started = Date.now();
-      const resultSets = await this.mysql.query(connection, appendLimitHint(sql, rowLimit), schema || connection.database);
+      const resultSets = await this.mysql.query(connection, query.sql, schema || connection.database);
       const elapsedMs = Date.now() - started;
       const schemaChanged = hasSchemaChangingSql(sql);
+      const pagination = applyConsoleResultPagination(resultSets, query.pagination);
       const result = {
         kind: 'query',
         connection,
         schema: schema || connection.database,
         sql,
         elapsedMs,
-        resultSets
+        resultSets,
+        pagination
       };
       this.panelResults.set(panel, result);
       if (schemaChanged) {
@@ -1776,7 +1783,7 @@ class SqlConsoleView {
         type: 'results',
         state: 'success',
         message: schemaChanged ? `Completed in ${elapsedMs} ms. Schema refreshed.` : `Completed in ${elapsedMs} ms.`,
-        html: renderQueryResults(result)
+        html: renderQueryResults(result, { showSql: false, showRefresh: true })
       });
     } catch (error) {
       await panel.webview.postMessage({
@@ -1811,7 +1818,7 @@ class SqlConsoleView {
         type: 'results',
         state: 'success',
         message: `Explained in ${elapsedMs} ms.`,
-        html: renderExplainResults(result)
+        html: renderExplainResults(result, { showSql: false })
       });
     } catch (error) {
       await panel.webview.postMessage({
@@ -3171,20 +3178,80 @@ function stripLeadingSqlComments(sql) {
 }
 
 function appendLimitHint(sql, maxRows) {
-  if (maxRows === NO_ROW_LIMIT || maxRows === undefined || maxRows === null) {
-    return sql;
+  return buildAutoLimitedSelectSql(sql, maxRows) || sql;
+}
+
+function buildConsoleQuery(sql, rowLimit, page = FIRST_RESULT_PAGE) {
+  const pageSize = normalizeRowLimit(rowLimit);
+  const normalizedPage = normalizeResultPage(page);
+  if (pageSize === NO_ROW_LIMIT) {
+    return { sql };
   }
 
-  const trimmed = sql.trim();
+  const paginatedSql = buildAutoLimitedSelectSql(sql, pageSize + 1, normalizedPage * pageSize);
+  if (!paginatedSql) {
+    return { sql: appendLimitHint(sql, rowLimit) };
+  }
+
+  return {
+    sql: paginatedSql,
+    pagination: {
+      page: normalizedPage,
+      pageSize
+    }
+  };
+}
+
+function buildAutoLimitedSelectSql(sql, maxRows, offset = 0) {
+  if (maxRows === NO_ROW_LIMIT || maxRows === undefined || maxRows === null) {
+    return '';
+  }
+
+  const trimmed = String(sql || '').trim();
   const withoutLeadingComments = trimmed.replace(/^(--.*\r?\n|\s)*/g, '');
   const isPlainSelect = /^select\b/i.test(withoutLeadingComments);
   const hasLimit = /\blimit\s+\d+\b/i.test(withoutLeadingComments);
   if (!isPlainSelect || hasLimit) {
-    return sql;
+    return '';
   }
 
   const withoutSemi = trimmed.replace(/;\s*$/, '');
-  return `${withoutSemi}\nlimit ${normalizeRowLimit(maxRows)};`;
+  const normalizedOffset = Math.max(0, Number(offset) || 0);
+  const offsetSql = normalizedOffset > 0 ? ` offset ${normalizedOffset}` : '';
+  return `${withoutSemi}\nlimit ${normalizeRowLimit(maxRows)}${offsetSql};`;
+}
+
+function applyConsoleResultPagination(resultSets, pagination) {
+  if (!pagination || !Array.isArray(resultSets) || resultSets.length !== 1) {
+    return undefined;
+  }
+
+  const resultSet = resultSets[0];
+  if (!Array.isArray(resultSet?.rows)) {
+    return undefined;
+  }
+
+  const rows = resultSet.rows;
+  const hasNext = rows.length > pagination.pageSize;
+  if (hasNext) {
+    resultSet.rows = rows.slice(0, pagination.pageSize);
+  }
+
+  return {
+    page: pagination.page,
+    pageSize: pagination.pageSize,
+    rowCount: resultSet.rows.length,
+    hasPrevious: pagination.page > FIRST_RESULT_PAGE,
+    hasNext
+  };
+}
+
+function normalizeResultPage(value) {
+  const page = Number(value);
+  if (!Number.isInteger(page) || page < FIRST_RESULT_PAGE) {
+    return FIRST_RESULT_PAGE;
+  }
+  return page;
 }
 
 function buildTableDataQuery(schema, tableName, columns, state) {
@@ -4746,7 +4813,9 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       }
     }
     textarea::selection {
-      background: var(--vscode-editor-selectionBackground);
+      color: var(--vscode-editor-selectionForeground, var(--input-fg));
+      background: var(--vscode-editor-selectionBackground, rgba(0, 122, 204, 0.35));
+      -webkit-text-fill-color: var(--vscode-editor-selectionForeground, var(--input-fg));
     }
     .sql-token.keyword {
       color: var(--sql-keyword);
@@ -4905,13 +4974,40 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       padding: 8px 10px;
       font-weight: 600;
     }
+    .result-actions,
     .export-actions {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       gap: 6px;
       justify-content: flex-end;
     }
-    .export-button {
+    .result-pagination {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .pagination-button {
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      min-width: 24px;
+      padding: 2px;
+      line-height: 1;
+    }
+    .pagination-button:disabled {
+      opacity: 0.45;
+    }
+    .pagination-label {
+      min-width: 72px;
+      text-align: center;
+      white-space: nowrap;
+    }
+    .export-button,
+    .export-select {
       min-height: 22px;
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -4923,8 +5019,49 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       font-weight: 500;
       cursor: pointer;
     }
-    .export-button:hover {
+    .export-button:hover,
+    .export-select:hover {
       background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .export-select {
+      width: 24px;
+      min-width: 24px;
+      height: 22px;
+      min-height: 22px;
+      padding: 0;
+      color: transparent;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+    .export-select option {
+      color: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+      background: var(--vscode-input-background, var(--vscode-editor-background));
+    }
+    .export-select-wrap {
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      min-width: 24px;
+      height: 22px;
+      color: var(--vscode-button-secondaryForeground);
+    }
+    .export-select-wrap .button-icon {
+      position: absolute;
+      pointer-events: none;
+    }
+    .refresh-query-button {
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      min-width: 24px;
+      padding: 2px;
+      line-height: 1;
+    }
+    .button-icon {
+      width: 14px;
+      height: 14px;
+      pointer-events: none;
     }
     .scroller {
       overflow: auto;
@@ -5303,6 +5440,7 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     let saveTimer;
     let completionTimer;
     let completionRequestId = 0;
+    let busy = false;
     let completionState = {
       items: [],
       selectedIndex: 0,
@@ -5311,11 +5449,15 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
     };
 
     function setBusy(isBusy) {
+      busy = isBusy;
       run.disabled = isBusy;
       explain.disabled = isBusy;
       clear.disabled = isBusy;
       schema.disabled = isBusy;
       rowLimit.disabled = isBusy;
+      results.querySelectorAll('[data-refresh-query], [data-page-action]').forEach((button) => {
+        button.disabled = isBusy;
+      });
     }
 
     function setStatus(state, message) {
@@ -5722,12 +5864,13 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       return line;
     }
 
-    function post(command) {
+    function post(command, extra = {}) {
       const state = snapshot();
       vscode.setState(state);
       vscode.postMessage({
         command,
-        ...state
+        ...state,
+        ...extra
       });
     }
 
@@ -5944,16 +6087,46 @@ function renderSqlConsoleHtml({ connection, schemas, selectedSchema, selectedRow
       sql.focus();
     });
     results.addEventListener('click', (event) => {
-      const button = event.target?.closest?.('[data-export-format]');
-      if (!button || !results.contains(button)) {
+      const refreshButton = event.target?.closest?.('[data-refresh-query]');
+      if (refreshButton && results.contains(refreshButton)) {
+        event.preventDefault();
+        if (!busy) {
+          hideCompletion();
+          execute();
+        }
+        return;
+      }
+
+      const pageButton = event.target?.closest?.('[data-page-action]');
+      if (pageButton && results.contains(pageButton)) {
+        event.preventDefault();
+        const pagination = pageButton.closest('[data-result-pagination]');
+        const currentPage = Number(pagination?.dataset.page || 0);
+        const nextPage = pageButton.dataset.pageAction === 'next'
+          ? currentPage + 1
+          : currentPage - 1;
+        if (!busy && nextPage >= 0) {
+          hideCompletion();
+          setBusy(true);
+          setStatus('busy', 'Loading page...');
+          post('pageQuery', { page: nextPage });
+        }
+        return;
+      }
+    });
+
+    results.addEventListener('change', (event) => {
+      const select = event.target?.closest?.('[data-export-select]');
+      if (!select || !results.contains(select) || !select.value) {
         return;
       }
 
       vscode.postMessage({
         command: 'exportResultSet',
-        format: button.dataset.exportFormat,
-        resultSetIndex: Number(button.dataset.resultSet)
+        format: select.value,
+        resultSetIndex: Number(select.dataset.resultSet)
       });
+      select.value = '';
     });
     schema.addEventListener('change', () => {
       hideCompletion();
@@ -8283,13 +8456,16 @@ function renderResultHtml(result) {
       padding: 8px 10px;
       font-weight: 600;
     }
+    .result-actions,
     .export-actions {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       gap: 6px;
       justify-content: flex-end;
     }
-    .export-button {
+    .export-button,
+    .export-select {
       min-height: 22px;
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -8301,8 +8477,36 @@ function renderResultHtml(result) {
       font-weight: 500;
       cursor: pointer;
     }
-    .export-button:hover {
+    .export-button:hover,
+    .export-select:hover {
       background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .export-select {
+      width: 24px;
+      min-width: 24px;
+      height: 22px;
+      min-height: 22px;
+      padding: 0;
+      color: transparent;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+    .export-select option {
+      color: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+      background: var(--vscode-input-background, var(--vscode-editor-background));
+    }
+    .export-select-wrap {
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      min-width: 24px;
+      height: 22px;
+      color: var(--vscode-button-secondaryForeground);
+    }
+    .export-select-wrap .button-icon {
+      position: absolute;
+      pointer-events: none;
     }
     .scroller {
       overflow: auto;
@@ -8631,26 +8835,34 @@ function renderResultHtml(result) {
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    document.addEventListener('click', (event) => {
-      const button = event.target?.closest?.('[data-export-format]');
-      if (!button) {
+    document.addEventListener('change', (event) => {
+      const select = event.target?.closest?.('[data-export-select]');
+      if (!select || !select.value) {
         return;
       }
 
       vscode.postMessage({
         command: 'exportResultSet',
-        format: button.dataset.exportFormat,
-        resultSetIndex: Number(button.dataset.resultSet)
+        format: select.value,
+        resultSetIndex: Number(select.dataset.resultSet)
       });
+      select.value = '';
     });
   </script>
 </body>
 </html>`;
 }
 
-function renderExplainResults(result) {
+function renderExplainResults(result, { showSql = true } = {}) {
   const planRows = result.planRows || [];
   const treeText = explainTreeTextFromRows(planRows);
+  const sqlBlock = showSql
+    ? `<section class="block">
+      <div class="block-title">SQL</div>
+      <pre><code>${escapeHtml(result.sql)}</code></pre>
+    </section>`
+    : '';
+
   return `<header class="header">
     <div>
       <h1 class="title">${escapeHtml(result.connection.name)} Explain</h1>
@@ -8658,10 +8870,7 @@ function renderExplainResults(result) {
     </div>
     <span class="pill">${result.elapsedMs} ms</span>
   </header>
-  <section class="block">
-    <div class="block-title">SQL</div>
-    <pre><code>${escapeHtml(result.sql)}</code></pre>
-  </section>
+  ${sqlBlock}
   <section class="block">
     <div class="block-title">Plan Details</div>
     <div class="scroller">${treeText
@@ -8978,13 +9187,17 @@ function formatExplainDetailCell(value) {
     .join('');
 }
 
-function renderQueryResults(result) {
+function renderQueryResults(result, { showSql = true, showRefresh = false } = {}) {
   const resultBlocks = result.resultSets.map((set, index) => {
     const title = set.label || `Result ${index + 1}`;
+    const pagination = index === 0 ? result.pagination : undefined;
     if (!set.rows.length) {
       return `<section class="block">
-        <div class="block-title">${escapeHtml(title)}</div>
-        <div class="empty">${escapeHtml(set.message || 'No rows returned.')}</div>
+        <div class="block-title">
+          <span>${escapeHtml(title)}</span>
+          ${renderResultSetHeaderActions(index, { showRefresh, showExport: false, pagination })}
+        </div>
+        <div class="empty">${escapeHtml(pagination ? 'No rows on this page.' : set.message || 'No rows returned.')}</div>
       </section>`;
     }
 
@@ -8992,7 +9205,7 @@ function renderQueryResults(result) {
       return `<section class="block">
         <div class="block-title">
           <span>${escapeHtml(explainTreeResultTitle(set))}</span>
-          ${renderExportActions(index)}
+          ${renderResultSetHeaderActions(index, { showRefresh })}
         </div>
         ${renderExplainTreeText(explainTreeResultText(set))}
       </section>`;
@@ -9001,11 +9214,18 @@ function renderQueryResults(result) {
     return `<section class="block">
       <div class="block-title">
         <span>${escapeHtml(title)} · ${set.rows.length} row${set.rows.length === 1 ? '' : 's'}</span>
-        ${renderExportActions(index)}
+        ${renderResultSetHeaderActions(index, { showRefresh, pagination })}
       </div>
       <div class="scroller">${renderTable(set.rows)}</div>
     </section>`;
   }).join('');
+
+  const sqlBlock = showSql
+    ? `<section class="block">
+      <div class="block-title">SQL</div>
+      <pre><code>${escapeHtml(result.sql)}</code></pre>
+    </section>`
+    : '';
 
   return `<header class="header">
     <div>
@@ -9014,10 +9234,7 @@ function renderQueryResults(result) {
     </div>
     <span class="pill">${result.elapsedMs} ms</span>
   </header>
-  <section class="block">
-    <div class="block-title">SQL</div>
-    <pre><code>${escapeHtml(result.sql)}</code></pre>
-  </section>
+  ${sqlBlock}
   ${resultBlocks}`;
 }
 
@@ -9167,16 +9384,81 @@ function explainTreeChildCapacity(line) {
   return 0;
 }
 
-function renderExportActions(resultSetIndex) {
-  return `<div class="export-actions" aria-label="Export result set">
-    ${renderExportButton(resultSetIndex, 'csv', 'CSV')}
-    ${renderExportButton(resultSetIndex, 'json', 'JSON')}
-    ${renderExportButton(resultSetIndex, 'markdown', 'Markdown')}
+function renderResultSetHeaderActions(resultSetIndex, { showRefresh = false, showExport = true, pagination } = {}) {
+  const actions = [
+    renderResultPagination(resultSetIndex, pagination),
+    showRefresh ? renderRefreshQueryButton() : '',
+    showExport ? renderExportActions(resultSetIndex) : ''
+  ].filter(Boolean).join('');
+
+  return actions ? `<div class="result-actions">${actions}</div>` : '';
+}
+
+function renderResultPagination(resultSetIndex, pagination) {
+  if (!pagination || (!pagination.hasPrevious && !pagination.hasNext)) {
+    return '';
+  }
+
+  const page = normalizeResultPage(pagination.page);
+  const normalizedPageSize = normalizeRowLimit(pagination.pageSize);
+  const pageSize = typeof normalizedPageSize === 'number' ? normalizedPageSize : Math.max(1, Number(pagination.rowCount) || 1);
+  const rowCount = Math.max(0, Number(pagination.rowCount) || 0);
+  const start = rowCount > 0 ? page * pageSize + 1 : 0;
+  const end = rowCount > 0 ? page * pageSize + rowCount : 0;
+  const label = rowCount > 0 ? `${start}-${end}` : `Page ${page + 1}`;
+  const previousDisabled = pagination.hasPrevious ? '' : ' disabled';
+  const nextDisabled = pagination.hasNext ? '' : ' disabled';
+
+  return `<div class="result-pagination" data-result-pagination="${resultSetIndex}" data-page="${page}" aria-label="Result pages">
+    <button class="export-button pagination-button" type="button" data-page-action="previous" title="Previous page" aria-label="Previous page"${previousDisabled}>${renderChevronLeftIcon()}</button>
+    <span class="pagination-label">${escapeHtml(label)}</span>
+    <button class="export-button pagination-button" type="button" data-page-action="next" title="Next page" aria-label="Next page"${nextDisabled}>${renderChevronRightIcon()}</button>
   </div>`;
 }
 
-function renderExportButton(resultSetIndex, format, label) {
-  return `<button class="export-button" type="button" data-export-format="${format}" data-result-set="${resultSetIndex}">${label}</button>`;
+function renderRefreshQueryButton() {
+  return `<button class="export-button refresh-query-button" type="button" data-refresh-query title="Refresh query" aria-label="Refresh query">${renderRefreshIcon()}</button>`;
+}
+
+function renderRefreshIcon() {
+  return `<svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+    <path d="M13 8a5 5 0 1 1-1.46-3.54" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+    <path d="M13 3.5V7h-3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+function renderChevronLeftIcon() {
+  return `<svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+    <path d="M10 3.5 5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+function renderChevronRightIcon() {
+  return `<svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+    <path d="m6 3.5 4.5 4.5L6 12.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+function renderExportIcon() {
+  return `<svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+    <path d="M8 2.5v7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+    <path d="m5.25 6.75 2.75 2.75 2.75-2.75" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M3.5 11.5v1.25c0 .41.34.75.75.75h7.5c.41 0 .75-.34.75-.75V11.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </svg>`;
+}
+
+function renderExportActions(resultSetIndex) {
+  return `<div class="export-actions" aria-label="Export result set">
+    <span class="export-select-wrap" title="Export result set">
+      ${renderExportIcon()}
+      <select class="export-select" data-export-select data-result-set="${resultSetIndex}" aria-label="Export result set">
+        <option value="" selected disabled hidden></option>
+        <option value="csv">CSV</option>
+        <option value="json">JSON</option>
+        <option value="markdown">Markdown</option>
+      </select>
+    </span>
+  </div>`;
 }
 
 function renderObjectDetails(result) {

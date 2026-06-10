@@ -1,5 +1,10 @@
 # Change Log
 
+## 0.4.6
+
+- Added paging and refresh controls for SQL console result sets when row limits are applied.
+- Replaced separate result export buttons with a compact icon dropdown for CSV, JSON, and Markdown.
+
 ## 0.4.5
 
 - Fixed table data views so wide result sets expose the horizontal scrollbar while column headers remain visible.
